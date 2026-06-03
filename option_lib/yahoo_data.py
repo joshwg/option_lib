@@ -632,6 +632,37 @@ def fetch_option_theoretical_price(symbol: str, expiration_iso: str, strike: flo
         return None
 
 
+def fetch_option_delta(symbol: str, expiration_iso: str, strike: float,
+                       option_type: str, r: float = 0.045):
+    """Return the probability of assignment (0–1) for the given contract, or None.
+
+    Uses the absolute value of Black-Scholes delta so callers always receive a
+    value in [0, 1] regardless of whether the option is a call or a put.
+
+    On expiration day (T == 0) returns 1.0 if ITM, 0.0 if OTM.
+    """
+    try:
+        side = 'call' if option_type.upper() in ('CALL', 'STOCK') else 'put'
+        info = get_stock_info(symbol)
+        S = info.get('current_price') if info.get('success') else None
+        if not S:
+            return None
+        T = get_years_to_expiration(expiration_iso)
+        if T <= 0:
+            # Expiration day: binary — ITM = certain assignment
+            if side == 'call':
+                return 1.0 if S > strike else 0.0
+            else:
+                return 1.0 if S < strike else 0.0
+        iv = get_implied_volatility_for_strike(symbol, expiration_iso, strike, option_type=side, S=S, r=r)
+        if not iv:
+            return None
+        greeks = _pricing.calculate_greeks(S, strike, T, r, iv, option_type=side)
+        return abs(greeks['delta'])
+    except Exception:
+        return None
+
+
 def fetch_option_theta(symbol: str, expiration_iso: str, strike: float,
                        option_type: str, r: float = 0.045):
     """Return Black-Scholes theta (per share per day) for the given contract, or None.
