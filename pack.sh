@@ -8,6 +8,8 @@ rm -f "$OUT"
 
 tar -czf "$OUT" \
     --exclude='.git' \
+    --exclude='.gitignore' \
+    --exclude='.pytest_cache' \
     --exclude='venv' \
     --exclude='__pycache__' \
     --exclude='*.pyc' \
