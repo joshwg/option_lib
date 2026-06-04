@@ -3,6 +3,7 @@ Yahoo Finance Data Fetcher
 Downloads stock prices, historical data, and option information
 """
 
+import math
 import os
 import time
 import yfinance as yf
@@ -11,6 +12,17 @@ import numpy as np
 import requests
 import pytz
 from option_lib import pricing as _pricing
+
+
+def _safe_float(value, default=None):
+    """Return *value* as a float, or *default* if it is None/NaN/non-numeric."""
+    if value is None:
+        return default
+    try:
+        f = float(value)
+        return default if math.isnan(f) or math.isinf(f) else f
+    except (TypeError, ValueError):
+        return default
 
 
 class _TTLCache:
@@ -69,6 +81,10 @@ def normalize_implied_volatility(iv_value):
     float: Normalized IV as decimal (e.g., 0.25 for 25%)
     """
     if iv_value is None or iv_value == 0:
+        return 0
+
+    # Guard against NaN/Infinity coming from Yahoo Finance
+    if isinstance(iv_value, float) and (math.isnan(iv_value) or math.isinf(iv_value)):
         return 0
 
     # If value is greater than 2, it's likely already a percentage (e.g., 25.5 for 25.5%)
@@ -392,26 +408,26 @@ def get_options_for_expiration(ticker, expiration_date):
         for _, row in calls.iterrows():
             iv = normalize_implied_volatility(row.get('impliedVolatility', 0))
             calls_data.append({
-                'strike': row['strike'],
-                'last_price': row['lastPrice'],
-                'bid': row['bid'],
-                'ask': row['ask'],
-                'volume': row.get('volume', 0),
-                'open_interest': row.get('openInterest', 0),
-                'implied_volatility': iv
+                'strike':             _safe_float(row['strike'], 0),
+                'last_price':         _safe_float(row['lastPrice'], 0),
+                'bid':                _safe_float(row['bid'], 0),
+                'ask':                _safe_float(row['ask'], 0),
+                'volume':             _safe_float(row.get('volume'), 0),
+                'open_interest':      _safe_float(row.get('openInterest'), 0),
+                'implied_volatility': iv,
             })
 
         puts_data = []
         for _, row in puts.iterrows():
             iv = normalize_implied_volatility(row.get('impliedVolatility', 0))
             puts_data.append({
-                'strike': row['strike'],
-                'last_price': row['lastPrice'],
-                'bid': row['bid'],
-                'ask': row['ask'],
-                'volume': row.get('volume', 0),
-                'open_interest': row.get('openInterest', 0),
-                'implied_volatility': iv
+                'strike':             _safe_float(row['strike'], 0),
+                'last_price':         _safe_float(row['lastPrice'], 0),
+                'bid':                _safe_float(row['bid'], 0),
+                'ask':                _safe_float(row['ask'], 0),
+                'volume':             _safe_float(row.get('volume'), 0),
+                'open_interest':      _safe_float(row.get('openInterest'), 0),
+                'implied_volatility': iv,
             })
 
         result = {
