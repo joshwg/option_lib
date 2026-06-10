@@ -612,7 +612,12 @@ def get_expiration_dates(ticker):
 
 def fetch_option_theoretical_price(symbol: str, expiration_iso: str, strike: float,
                                    option_type: str, r: float = 0.045):
-    """Return Black-Scholes theoretical price for the given contract, or None.
+    """Return American-binomial theoretical price for the given contract, or None.
+
+    Uses the CRR binomial tree model so that early-exercise value and dividend
+    yield (q) are correctly reflected.  The implied volatility is still derived
+    from the market bid/ask mid via Black-Scholes (the industry convention for
+    quoting IV), then fed into the American model.
 
     Parameters:
     symbol (str): Ticker symbol
@@ -630,20 +635,15 @@ def fetch_option_theoretical_price(symbol: str, expiration_iso: str, strike: flo
         S = info.get('current_price') if info.get('success') else None
         if not S:
             return None
+        q = info.get('dividend_yield', 0) or 0   # already normalised to decimal
         T = get_years_to_expiration(expiration_iso)
         if T <= 0:
             # Expiration day: theoretical price is intrinsic value
-            if side == 'call':
-                return max(S - strike, 0.0)
-            else:
-                return max(strike - S, 0.0)
+            return max(S - strike, 0.0) if side == 'call' else max(strike - S, 0.0)
         iv = get_implied_volatility_for_strike(symbol, expiration_iso, strike, option_type=side, S=S, r=r)
         if not iv:
             return None
-        if side == 'call':
-            return _pricing.black_scholes_call(S, strike, T, r, iv)
-        else:
-            return _pricing.black_scholes_put(S, strike, T, r, iv)
+        return _pricing.american_option_binomial(S, strike, T, r, iv, q, side)
     except Exception:
         return None
 
@@ -652,8 +652,9 @@ def fetch_option_delta(symbol: str, expiration_iso: str, strike: float,
                        option_type: str, r: float = 0.045):
     """Return the probability of assignment (0–1) for the given contract, or None.
 
-    Uses the absolute value of Black-Scholes delta so callers always receive a
-    value in [0, 1] regardless of whether the option is a call or a put.
+    Uses the absolute value of the American-binomial delta so that early-exercise
+    risk and dividends are reflected.  Returns a value in [0, 1] for both calls
+    and puts.
 
     On expiration day (T == 0) returns 1.0 if ITM, 0.0 if OTM.
     """
@@ -663,17 +664,15 @@ def fetch_option_delta(symbol: str, expiration_iso: str, strike: float,
         S = info.get('current_price') if info.get('success') else None
         if not S:
             return None
+        q = info.get('dividend_yield', 0) or 0
         T = get_years_to_expiration(expiration_iso)
         if T <= 0:
             # Expiration day: binary — ITM = certain assignment
-            if side == 'call':
-                return 1.0 if S > strike else 0.0
-            else:
-                return 1.0 if S < strike else 0.0
+            return (1.0 if S > strike else 0.0) if side == 'call' else (1.0 if S < strike else 0.0)
         iv = get_implied_volatility_for_strike(symbol, expiration_iso, strike, option_type=side, S=S, r=r)
         if not iv:
             return None
-        greeks = _pricing.calculate_greeks(S, strike, T, r, iv, option_type=side)
+        greeks = _pricing.american_option_greeks(S, strike, T, r, iv, q, option_type=side)
         return abs(greeks['delta'])
     except Exception:
         return None
@@ -681,10 +680,10 @@ def fetch_option_delta(symbol: str, expiration_iso: str, strike: float,
 
 def fetch_option_theta(symbol: str, expiration_iso: str, strike: float,
                        option_type: str, r: float = 0.045):
-    """Return Black-Scholes theta (per share per day) for the given contract, or None.
+    """Return American-binomial theta (per share per day) for the given contract, or None.
 
-    Uses the implied volatility from the Yahoo Finance option chain together
-    with the pricing.calculate_greeks() Black-Scholes model.
+    Theta is the $ change in the option's value from today to tomorrow, so it is
+    negative when the option loses time value (the usual case for short sellers).
 
     Parameters:
     symbol (str): Ticker symbol
@@ -694,7 +693,7 @@ def fetch_option_theta(symbol: str, expiration_iso: str, strike: float,
     r (float): Risk-free rate as decimal (default 0.045)
 
     Returns:
-    float: Theta per share per day (negative for long options), or None on failure
+    float: Theta per share per day (negative = time decay), or None on failure
     """
     try:
         side = 'call' if option_type.upper() in ('CALL', 'STOCK') else 'put'
@@ -702,6 +701,7 @@ def fetch_option_theta(symbol: str, expiration_iso: str, strike: float,
         S = info.get('current_price') if info.get('success') else None
         if not S:
             return None
+        q = info.get('dividend_yield', 0) or 0
         T = get_years_to_expiration(expiration_iso)
         if T <= 0:
             # Expiration day: theta = remaining time value = market_price - intrinsic
@@ -717,12 +717,11 @@ def fetch_option_theta(symbol: str, expiration_iso: str, strike: float,
                 return None
             mid = (bid + ask) / 2.0
             intrinsic = max(S - strike, 0.0) if side == 'call' else max(strike - S, 0.0)
-            # Return as negative (theta is a cost to the option holder / gain to the seller)
             return -(mid - intrinsic)
         iv = get_implied_volatility_for_strike(symbol, expiration_iso, strike, option_type=side, S=S, r=r)
         if not iv:
             return None
-        greeks = _pricing.calculate_greeks(S, strike, T, r, iv, option_type=side)
+        greeks = _pricing.american_option_greeks(S, strike, T, r, iv, q, option_type=side)
         return greeks['theta']
     except Exception:
         return None
