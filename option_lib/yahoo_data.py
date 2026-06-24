@@ -5,6 +5,7 @@ Downloads stock prices, historical data, and option information
 
 import math
 import os
+import threading
 import time
 import yfinance as yf
 from datetime import datetime, timedelta
@@ -14,39 +15,13 @@ import pytz
 from option_lib import pricing as _pricing
 
 
-def _safe_float(value, default=None):
-    """Return *value* as a float, or *default* if it is None/NaN/non-numeric."""
-    if value is None:
-        return default
-    try:
-        f = float(value)
-        return default if math.isnan(f) or math.isinf(f) else f
-    except (TypeError, ValueError):
-        return default
-
-
-class _TTLCache:
-    """Thread-safe in-memory cache with per-entry TTL."""
-
-    def __init__(self):
-        self._store = {}
-
-    def get(self, key):
-        entry = self._store.get(key)
-        if entry is None:
-            return None, False
-        value, expires_at = entry
-        if time.monotonic() < expires_at:
-            return value, True
-        del self._store[key]
-        return None, False
-
-    def set(self, key, value, ttl):
-        self._store[key] = (value, time.monotonic() + ttl)
-
-    def invalidate(self, key):
-        self._store.pop(key, None)
-
+from option_lib.math_util import (
+    safe_float as _safe_float,
+    TTLCache as _TTLCache,
+    iv_from_mid as _iv_from_mid,
+    get_days_to_expiration,
+    get_years_to_expiration,
+)
 
 _cache = _TTLCache()
 
@@ -56,17 +31,24 @@ _TTL_VOL      = int(os.environ.get('CACHE_TTL_VOL',     1800))
 _TTL_EXPIRIES = int(os.environ.get('CACHE_TTL_EXPIRIES', 1800))
 _TTL_SEARCH   = int(os.environ.get('CACHE_TTL_SEARCH',  3600))
 
+# ---------------------------------------------------------------------------
+# Rate limiting — 250 ms minimum gap between Yahoo Finance network calls.
+# The lock serialises concurrent threads so bursts don't exceed ~4 req/s.
+# ---------------------------------------------------------------------------
+_yf_lock = threading.Lock()
+_yf_last_call: float = 0.0
+_YF_MIN_INTERVAL = 0.250  # seconds
 
-def _iv_from_mid(bid, ask, S, K, T, r, option_type):
-    """Compute implied vol from bid/ask mid price. Returns None if inputs are invalid or Newton-Raphson doesn't converge."""
-    if not (bid > 0 and ask > 0 and S > 0 and K > 0 and T > 0):
-        return None
-    try:
-        return _pricing.implied_volatility(
-            (bid + ask) / 2.0, S, K, T, r, option_type=option_type
-        )
-    except Exception:
-        return None
+
+def _yf_rate_limit() -> None:
+    """Sleep if needed to maintain ≥250 ms between Yahoo Finance calls."""
+    global _yf_last_call
+    with _yf_lock:
+        wait = _YF_MIN_INTERVAL - (time.monotonic() - _yf_last_call)
+        if wait > 0:
+            time.sleep(wait)
+        _yf_last_call = time.monotonic()
+
 
 
 def normalize_implied_volatility(iv_value):
@@ -138,6 +120,7 @@ def search_ticker(query, max_results=10):
     if hit:
         return cached
 
+    _yf_rate_limit()
     try:
         url = "https://query2.finance.yahoo.com/v1/finance/search"
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -190,12 +173,14 @@ def get_stock_info(ticker):
     if hit:
         return cached
 
+    _yf_rate_limit()
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
 
-        # Get current price
-        current_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
+        # Get current price — discard implausible values from yfinance
+        _raw_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
+        current_price = float(_raw_price) if (_raw_price is not None and 0.01 <= float(_raw_price) <= 1_000_000) else None
 
         # Get dividend yield (as decimal, e.g., 0.02 for 2%)
         dividend_yield = info.get('dividendYield', 0) or 0
@@ -227,12 +212,18 @@ def get_stock_info(ticker):
             except:
                 pass
 
+        avg_volume = (
+            info.get('averageVolume')
+            or info.get('averageDailyVolume10Day')
+            or info.get('volume')
+        )
         result = {
             'ticker': ticker,
             'current_price': current_price,
             'company_name': info.get('longName', ticker),
             'previous_close': info.get('previousClose'),
             'volume': info.get('volume'),
+            'avg_volume': avg_volume,
             'market_cap': info.get('marketCap'),
             'dividend_yield': dividend_yield,
             'earnings_date': earnings_date,
@@ -272,6 +263,7 @@ def calculate_historical_volatility(ticker, period='1y', days=None):
     if hit:
         return cached
 
+    _yf_rate_limit()
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period=period)
@@ -304,6 +296,7 @@ def get_option_chain(ticker):
     if hit:
         return cached
 
+    _yf_rate_limit()
     try:
         stock = yf.Ticker(ticker)
         expirations = stock.options
@@ -396,6 +389,7 @@ def get_options_for_expiration(ticker, expiration_date):
     if hit:
         return cached
 
+    _yf_rate_limit()
     try:
         stock = yf.Ticker(ticker)
         opt = stock.option_chain(expiration_date)
@@ -550,38 +544,7 @@ def get_atm_implied_volatility(ticker, expiration_date, current_price, option_ty
         return None
 
 
-def get_days_to_expiration(expiration_date_str):
-    """
-    Calculate days to expiration
 
-    Parameters:
-    expiration_date_str (str): Expiration date in format 'YYYY-MM-DD'
-
-    Returns:
-    int: Number of days to expiration (0 on expiration day, never negative)
-    """
-    try:
-        expiration_date = datetime.strptime(expiration_date_str, '%Y-%m-%d').date()
-        today = datetime.now().date()
-        days = (expiration_date - today).days
-        return max(days, 0)  # Don't return negative days
-    except Exception as e:
-        print(f"Error calculating days to expiration: {e}")
-        return 0
-
-
-def get_years_to_expiration(expiration_date_str):
-    """
-    Calculate years to expiration (for Black-Scholes)
-
-    Parameters:
-    expiration_date_str (str): Expiration date in format 'YYYY-MM-DD'
-
-    Returns:
-    float: Years to expiration (0.0 on or after expiration day)
-    """
-    days = get_days_to_expiration(expiration_date_str)
-    return days / 365.0
 
 
 def get_stock_data(ticker):
@@ -725,3 +688,114 @@ def fetch_option_theta(symbol: str, expiration_iso: str, strike: float,
         return greeks['theta']
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Efficient combined fetcher — price + theta + delta in one round-trip
+# ---------------------------------------------------------------------------
+
+def _occ_symbol(symbol: str, expiration_iso: str, strike: float, option_type: str) -> str:
+    """Return the OCC option ticker, e.g. 'AAPL250718P00200000'.
+
+    Yahoo Finance accepts these as Ticker symbols for individual contract quotes,
+    avoiding the need to download the full option chain for an expiration date.
+    """
+    exp  = expiration_iso.replace('-', '')          # 'YYYYMMDD'
+    yy, mm, dd = exp[2:4], exp[4:6], exp[6:8]
+    side = 'C' if option_type.upper() in ('CALL', 'STOCK') else 'P'
+    return f"{symbol.upper()}{yy}{mm}{dd}{side}{int(round(strike * 1000)):08d}"
+
+
+def _get_contract_iv(symbol: str, expiration_iso: str, strike: float,
+                     option_type: str, S: float, r: float):
+    """Return IV for a single contract, using a targeted OCC-ticker quote where possible.
+
+    Queries the specific option ticker (e.g. 'AAPL250718P00200000') for bid/ask
+    and derives IV from the mid price.  This fetches only one contract from Yahoo
+    instead of the entire expiration's chain.  Falls back to the full chain if
+    the targeted quote is unavailable.
+    """
+    side = 'call' if option_type.upper() in ('CALL', 'STOCK') else 'put'
+    T    = get_years_to_expiration(expiration_iso)
+    occ  = _occ_symbol(symbol, expiration_iso, strike, option_type)
+
+    # Check cache for the bid/ask we already fetched for this contract.
+    cache_key = ('_contract_bid_ask', occ)
+    cached_ba, hit = _cache.get(cache_key)
+    if hit:
+        bid, ask = cached_ba
+    else:
+        bid, ask = None, None
+        try:
+            _yf_rate_limit()
+            info = yf.Ticker(occ).info
+            bid  = _safe_float(info.get('bid'),  None)
+            ask  = _safe_float(info.get('ask'),  None)
+            if bid and ask and bid > 0 and ask > 0:
+                _cache.set(cache_key, (bid, ask), _TTL_OPTIONS)
+        except Exception:
+            pass
+
+    if bid and ask and bid > 0 and ask > 0:
+        iv = _iv_from_mid(bid, ask, S, strike, T, r, side)
+        if iv:
+            return iv
+
+    # Fallback: full chain (already cached per (ticker, expiration) pair).
+    return get_implied_volatility_for_strike(symbol, expiration_iso, strike,
+                                             option_type=side, S=S, r=r)
+
+
+def fetch_option_greeks(symbol: str, expiration_iso: str, strike: float,
+                        option_type: str, r: float = 0.045) -> dict:
+    """Return price, theta, and delta for one contract in a single computation.
+
+    Compared to calling fetch_option_theoretical_price / fetch_option_theta /
+    fetch_option_delta separately, this function:
+      - Fetches stock info once  (vs 3x)
+      - Fetches IV once          (vs 3x, using a targeted single-contract quote)
+      - Runs the binomial tree 5 times (vs 11x: 1 + 5 + 5)
+
+    Returns:
+    dict with keys 'price', 'theta', 'delta'; any value may be None on failure.
+    """
+    _none = {'price': None, 'theta': None, 'delta': None}
+    try:
+        side = 'call' if option_type.upper() in ('CALL', 'STOCK') else 'put'
+        info = get_stock_info(symbol)
+        S    = info.get('current_price') if info.get('success') else None
+        if not S:
+            return _none
+        q = info.get('dividend_yield', 0) or 0
+        T = get_years_to_expiration(expiration_iso)
+
+        if T <= 0:
+            # Expiration day: intrinsic value; theta from live market quote.
+            intrinsic = max(S - strike, 0.0) if side == 'call' else max(strike - S, 0.0)
+            delta     = (1.0 if S > strike else 0.0) if side == 'call' else (1.0 if S < strike else 0.0)
+            theta     = None
+            occ = _occ_symbol(symbol, expiration_iso, strike, option_type)
+            try:
+                _yf_rate_limit()
+                opt_info = yf.Ticker(occ).info
+                bid = _safe_float(opt_info.get('bid'), None)
+                ask = _safe_float(opt_info.get('ask'), None)
+                if bid and ask and bid > 0 and ask > 0:
+                    theta = -((bid + ask) / 2.0 - intrinsic)
+            except Exception:
+                pass
+            return {'price': intrinsic, 'theta': theta, 'delta': delta}
+
+        iv = _get_contract_iv(symbol, expiration_iso, strike, option_type, S, r)
+        if not iv:
+            return _none
+
+        # One binomial-tree run now returns price alongside the greeks.
+        g = _pricing.american_option_greeks(S, strike, T, r, iv, q, option_type=side)
+        return {
+            'price': g['price'],
+            'theta': g['theta'],
+            'delta': abs(g['delta']),
+        }
+    except Exception:
+        return _none

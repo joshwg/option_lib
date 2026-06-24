@@ -57,6 +57,38 @@ def black_scholes_put(S, K, T, r, sigma):
     return put_price
 
 
+def prob_expire_otm(S, K, T, r, sigma, option_type='put'):
+    """
+    Risk-neutral probability that an option expires out-of-the-money (worthless).
+
+    For a put  : P(S_T > K) = N(d₂)
+    For a call : P(S_T < K) = N(−d₂)
+
+    This is the theoretical probability under the risk-neutral measure derived
+    from Black-Scholes and serves as a practical Probability-of-Profit (PoP)
+    estimate for short option positions.
+
+    Parameters:
+    S (float): Current stock price
+    K (float): Strike price
+    T (float): Time to expiration in years
+    r (float): Risk-free interest rate (as decimal)
+    sigma (float): Implied volatility (as decimal)
+    option_type (str): 'put' (default) or 'call'
+
+    Returns:
+    float: Probability in [0, 1], or float('nan') on degenerate input
+    """
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return float('nan')
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    if option_type == 'put':
+        return float(norm.cdf(d2))    # P(S_T > K) — put expires worthless
+    else:
+        return float(norm.cdf(-d2))   # P(S_T < K) — call expires worthless
+
+
 def calculate_greeks(S, K, T, r, sigma, option_type='call'):
     """
     Calculate option Greeks
@@ -276,4 +308,4 @@ def american_option_greeks(S, K, T, r, sigma, q=0, option_type='call', steps=100
     price_vup = american_option_binomial(S, K, T, r, sigma + d_sigma, q, option_type, steps)
     vega = price_vup - price_0         # $ change per 1 pp rise in IV
 
-    return {'delta': delta, 'gamma': gamma, 'theta': theta, 'vega': vega}
+    return {'price': price_0, 'delta': delta, 'gamma': gamma, 'theta': theta, 'vega': vega}
