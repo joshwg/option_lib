@@ -160,10 +160,21 @@ def get_stock_info(ticker: str) -> dict:
         day = t.get("day") or {}
         min_bar = t.get("min") or {}
         prev_day = t.get("prevDay") or {}
-        
+
         current_price = _safe_float(day.get("c") or min_bar.get("c") or prev_day.get("c"))
         volume = _safe_float(day.get("v") or prev_day.get("v"), 0)
         prev_close = _safe_float(prev_day.get("c"))
+
+        # Extended-hours prices — Polygon surfaces these directly on the snapshot.
+        # Fall back to the last-minute bar when it differs from the regular close
+        # (covers providers that don't populate the explicit fields).
+        pre_market_price  = _safe_float(t.get("preMarket"))
+        post_market_price = _safe_float(t.get("afterHours"))
+        if not pre_market_price and not post_market_price:
+            _min_c = _safe_float(min_bar.get("c"))
+            _day_c = _safe_float(day.get("c"))
+            if _min_c and _day_c and abs(_min_c - _day_c) > 0.001:
+                post_market_price = _min_c   # most recent trade; direction unknown
 
         # 2) Reference data - name, market cap, dividend yield
         market_cap     = None
@@ -204,17 +215,19 @@ def get_stock_info(ticker: str) -> dict:
             pass
 
         result = {
-            "ticker":         ticker,
-            "current_price":  current_price,
-            "company_name":   company_name,
-            "previous_close": prev_close,
-            "volume":         volume,
-            "avg_volume":     avg_volume,
-            "market_cap":     market_cap,
-            "dividend_yield": dividend_yield,
-            "earnings_date":  earnings_date,
-            "success":        True,
-            "_source":        "massive",
+            "ticker":             ticker,
+            "current_price":      current_price,
+            "company_name":       company_name,
+            "previous_close":     prev_close,
+            "volume":             volume,
+            "avg_volume":         avg_volume,
+            "market_cap":         market_cap,
+            "dividend_yield":     dividend_yield,
+            "earnings_date":      earnings_date,
+            "pre_market_price":   pre_market_price,
+            "post_market_price":  post_market_price,
+            "success":            True,
+            "_source":            "massive",
         }
         _cache.set(cache_key, result, _TTL_STOCK)
         return result

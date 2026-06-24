@@ -217,6 +217,21 @@ def get_stock_info(ticker):
             or info.get('averageDailyVolume10Day')
             or info.get('volume')
         )
+
+        # Extended-hours prices — only populated by yfinance when that session
+        # is active; None otherwise.
+        def _valid_price(v):
+            if v is None:
+                return None
+            try:
+                f = float(v)
+                return f if (math.isfinite(f) and 0.01 <= f <= 1_000_000) else None
+            except (TypeError, ValueError):
+                return None
+
+        pre_market_price  = _valid_price(info.get('preMarketPrice'))
+        post_market_price = _valid_price(info.get('postMarketPrice'))
+
         result = {
             'ticker': ticker,
             'current_price': current_price,
@@ -227,6 +242,8 @@ def get_stock_info(ticker):
             'market_cap': info.get('marketCap'),
             'dividend_yield': dividend_yield,
             'earnings_date': earnings_date,
+            'pre_market_price':  pre_market_price,
+            'post_market_price': post_market_price,
             'success': True
         }
         _cache.set(cache_key, result, _TTL_STOCK)
