@@ -662,6 +662,55 @@ def fetch_option_theta(
         return _yahoo.fetch_option_theta(symbol, expiration_iso, strike, option_type, r)
 
 
+def fetch_option_greeks(
+    symbol: str, expiration_iso: str, strike: float,
+    option_type: str, r: float = 0.045, use_extended: bool = False,
+) -> dict:
+    """Return price, theta, and delta in one computation.
+
+    Uses Massive for stock price and IV; falls back to yahoo_data when
+    MASSIVE_API_KEY is absent or any Massive call fails.
+    """
+    _none = {"price": None, "theta": None, "delta": None}
+    if not _is_key_set():
+        return _yahoo.fetch_option_greeks(
+            symbol, expiration_iso, strike, option_type, r, use_extended=use_extended
+        )
+    try:
+        side = "call" if option_type.upper() in ("CALL", "STOCK") else "put"
+        info = get_stock_info(symbol)
+        if not info.get("success"):
+            return _none
+        if use_extended:
+            S = (info.get("post_market_price") or info.get("pre_market_price")
+                 or info.get("current_price"))
+        else:
+            S = info.get("current_price")
+        if not S:
+            return _none
+        q = info.get("dividend_yield", 0) or 0
+        T = get_years_to_expiration(expiration_iso)
+        if T <= 0:
+            intrinsic = max(S - strike, 0.0) if side == "call" else max(strike - S, 0.0)
+            delta = (1.0 if S > strike else 0.0) if side == "call" else (1.0 if S < strike else 0.0)
+            return {"price": intrinsic, "theta": 0.0, "delta": delta}
+        iv = get_implied_volatility_for_strike(
+            symbol, expiration_iso, strike, option_type=side, S=S, r=r
+        )
+        if not iv:
+            return _none
+        g = _pricing.american_option_greeks(S, strike, T, r, iv, q, option_type=side)
+        return {
+            "price": g["price"],
+            "theta": g["theta"],
+            "delta": abs(g["delta"]),
+        }
+    except Exception:
+        return _yahoo.fetch_option_greeks(
+            symbol, expiration_iso, strike, option_type, r, use_extended=use_extended
+        )
+
+
 # ── Compatibility shims ────────────────────────────────────────────────────────
 
 def search_ticker(query: str, max_results: int = 10) -> list:

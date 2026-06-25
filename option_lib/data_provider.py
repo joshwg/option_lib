@@ -160,6 +160,22 @@ class DataProvider(ABC):
     ) -> float | None:
         """American-binomial theta per share per day (negative = decay), or None."""
 
+    @abstractmethod
+    def fetch_option_greeks(
+        self,
+        symbol: str,
+        expiration_iso: str,
+        strike: float,
+        option_type: str,
+        r: float = 0.045,
+        use_extended: bool = False,
+    ) -> dict:
+        """Price, theta, and delta in one round-trip.
+
+        Returns dict with keys 'price', 'theta', 'delta'; any may be None.
+        When use_extended=True, uses the extended-hours stock price as S.
+        """
+
     # ── Ticker search ─────────────────────────────────────────────────────────
 
     @abstractmethod
@@ -239,6 +255,12 @@ class YahooDataProvider(DataProvider):
 
     def fetch_option_theta(self, symbol, expiration_iso, strike, option_type, r=0.045):
         return self._m.fetch_option_theta(symbol, expiration_iso, strike, option_type, r)
+
+    def fetch_option_greeks(self, symbol, expiration_iso, strike, option_type,
+                            r=0.045, use_extended=False):
+        return self._m.fetch_option_greeks(
+            symbol, expiration_iso, strike, option_type, r, use_extended=use_extended
+        )
 
     def search_ticker(self, query, max_results=10):
         return self._m.search_ticker(query, max_results=max_results)
@@ -323,6 +345,12 @@ class MassiveDataProvider(DataProvider):
 
     def fetch_option_theta(self, symbol, expiration_iso, strike, option_type, r=0.045):
         return self._m.fetch_option_theta(symbol, expiration_iso, strike, option_type, r)
+
+    def fetch_option_greeks(self, symbol, expiration_iso, strike, option_type,
+                            r=0.045, use_extended=False):
+        return self._m.fetch_option_greeks(
+            symbol, expiration_iso, strike, option_type, r, use_extended=use_extended
+        )
 
     def search_ticker(self, query, max_results=10):
         return self._m.search_ticker(query, max_results=max_results)

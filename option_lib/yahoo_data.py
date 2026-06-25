@@ -585,11 +585,24 @@ def get_implied_volatility_for_strike(ticker, expiration_date, strike, option_ty
             S = info.get('current_price') if info.get('success') else None
 
         T = get_years_to_expiration(expiration_date)
-        iv = _iv_from_mid(best_match['bid'], best_match['ask'], S, best_match['strike'], T, r, option_type)
+        K = best_match['strike']
+
+        # Primary: IV from bid/ask mid (most accurate when market is open)
+        iv = _iv_from_mid(best_match['bid'], best_match['ask'], S, K, T, r, option_type)
         if iv:
             return iv
 
-        # Fallback: Yahoo's pre-computed field
+        # Pre-market fallback: bid/ask are often 0 before open; use last traded price
+        last = _safe_float(best_match.get('last_price'), None)
+        if last and last > 0 and S and T > 0:
+            try:
+                iv = _pricing.implied_volatility(last, S, K, T, r, option_type=option_type)
+                if iv:
+                    return iv
+            except Exception:
+                pass
+
+        # Final fallback: Yahoo's pre-computed field (stale but better than None)
         return best_match['implied_volatility'] if best_match['implied_volatility'] > 0 else None
     except Exception as e:
         print(f"Error getting implied volatility: {e}")
