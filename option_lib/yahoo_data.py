@@ -764,7 +764,8 @@ def _get_contract_iv(symbol: str, expiration_iso: str, strike: float,
 
 
 def fetch_option_greeks(symbol: str, expiration_iso: str, strike: float,
-                        option_type: str, r: float = 0.045) -> dict:
+                        option_type: str, r: float = 0.045,
+                        use_extended: bool = False) -> dict:
     """Return price, theta, and delta for one contract in a single computation.
 
     Compared to calling fetch_option_theoretical_price / fetch_option_theta /
@@ -773,6 +774,10 @@ def fetch_option_greeks(symbol: str, expiration_iso: str, strike: float,
       - Fetches IV once          (vs 3x, using a targeted single-contract quote)
       - Runs the binomial tree 5 times (vs 11x: 1 + 5 + 5)
 
+    When use_extended=True, prefers post-market then pre-market price as S so
+    that $/shr, theta, and delta are all computed against the extended-hours
+    underlying price rather than the regular-session close.
+
     Returns:
     dict with keys 'price', 'theta', 'delta'; any value may be None on failure.
     """
@@ -780,7 +785,13 @@ def fetch_option_greeks(symbol: str, expiration_iso: str, strike: float,
     try:
         side = 'call' if option_type.upper() in ('CALL', 'STOCK') else 'put'
         info = get_stock_info(symbol)
-        S    = info.get('current_price') if info.get('success') else None
+        if not info.get('success'):
+            return _none
+        if use_extended:
+            S = (info.get('post_market_price') or info.get('pre_market_price')
+                 or info.get('current_price'))
+        else:
+            S = info.get('current_price')
         if not S:
             return _none
         q = info.get('dividend_yield', 0) or 0
