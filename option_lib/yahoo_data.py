@@ -14,6 +14,12 @@ import requests
 import pytz
 from option_lib import pricing as _pricing
 
+# Import YFRateLimitError if available (yfinance ≥ 0.2.28)
+try:
+    from yfinance.exceptions import YFRateLimitError as _YFRateLimitError
+except ImportError:
+    _YFRateLimitError = None
+
 
 from option_lib.math_util import (
     safe_float as _safe_float,
@@ -30,24 +36,43 @@ _TTL_OPTIONS  = int(os.environ.get('CACHE_TTL_OPTIONS',  300))
 _TTL_VOL      = int(os.environ.get('CACHE_TTL_VOL',     1800))
 _TTL_EXPIRIES = int(os.environ.get('CACHE_TTL_EXPIRIES', 1800))
 _TTL_SEARCH   = int(os.environ.get('CACHE_TTL_SEARCH',  3600))
+_TTL_EARNINGS = int(os.environ.get('CACHE_TTL_EARNINGS', 86400))  # 24 h — dates rarely change
 
 # ---------------------------------------------------------------------------
-# Rate limiting — 250 ms minimum gap between Yahoo Finance network calls.
-# The lock serialises concurrent threads so bursts don't exceed ~4 req/s.
+# Rate limiting — minimum gap between Yahoo Finance network calls.
+# The lock serialises concurrent threads.  _YF_MIN_INTERVAL starts at 250 ms
+# and is increased automatically after each 429 (up to _YF_MAX_INTERVAL).
 # ---------------------------------------------------------------------------
-_yf_lock = threading.Lock()
+_yf_lock         = threading.Lock()
 _yf_last_call: float = 0.0
-_YF_MIN_INTERVAL = 0.250  # seconds
+_YF_MIN_INTERVAL = 0.250   # seconds — raised on rate-limit events
+_YF_MAX_INTERVAL = 3.0     # ceiling after repeated rate limiting
+_YF_RATE_SLEEP   = 10.0    # seconds to pause after a 429
+_YF_BACKOFF_STEP = 0.25    # how much to add to _YF_MIN_INTERVAL per 429
 
 
 def _yf_rate_limit() -> None:
-    """Sleep if needed to maintain ≥250 ms between Yahoo Finance calls."""
+    """Sleep if needed to honour the current minimum inter-call interval."""
     global _yf_last_call
     with _yf_lock:
         wait = _YF_MIN_INTERVAL - (time.monotonic() - _yf_last_call)
         if wait > 0:
             time.sleep(wait)
         _yf_last_call = time.monotonic()
+
+
+def _on_rate_limited() -> None:
+    """Called when Yahoo Finance returns a 429.  Sleeps and slows the interval."""
+    global _YF_MIN_INTERVAL
+    with _yf_lock:
+        _YF_MIN_INTERVAL = min(_YF_MIN_INTERVAL + _YF_BACKOFF_STEP, _YF_MAX_INTERVAL)
+        new_interval = _YF_MIN_INTERVAL
+    print(
+        f"[yahoo_data] Rate limited — sleeping {_YF_RATE_SLEEP:.0f}s "
+        f"(inter-call interval now {new_interval:.2f}s)",
+        flush=True,
+    )
+    time.sleep(_YF_RATE_SLEEP)
 
 
 
@@ -121,41 +146,92 @@ def search_ticker(query, max_results=10):
         return cached
 
     _yf_rate_limit()
-    try:
-        url = "https://query2.finance.yahoo.com/v1/finance/search"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        params = {
-            'q': query,
-            'quotesCount': max_results,
-            'newsCount': 0,
-            'enableFuzzyQuery': False,
-            'quotesQueryId': 'tss_match_phrase_query'
-        }
+    for _attempt in range(3):
+        try:
+            url = "https://query2.finance.yahoo.com/v1/finance/search"
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            params = {
+                'q': query,
+                'quotesCount': max_results,
+                'newsCount': 0,
+                'enableFuzzyQuery': False,
+                'quotesQueryId': 'tss_match_phrase_query'
+            }
 
-        response = requests.get(url, headers=headers, params=params, timeout=5)
+            response = requests.get(url, headers=headers, params=params, timeout=5)
 
-        if response.status_code != 200:
-            return []
+            if response.status_code == 429:
+                _on_rate_limited()
+                continue
+            if response.status_code != 200:
+                return []
 
-        data = response.json()
-        quotes = data.get('quotes', [])
+            data = response.json()
+            quotes = data.get('quotes', [])
 
-        results = []
-        for quote in quotes[:max_results]:
-            # Filter to only include stocks (equities)
-            if quote.get('quoteType') in ['EQUITY', 'ETF']:
-                results.append({
-                    'symbol': quote.get('symbol', ''),
-                    'name': quote.get('longname') or quote.get('shortname', ''),
-                    'exchange': quote.get('exchange', ''),
-                    'type': quote.get('quoteType', '')
-                })
+            results = []
+            for quote in quotes[:max_results]:
+                # Filter to only include stocks (equities)
+                if quote.get('quoteType') in ['EQUITY', 'ETF']:
+                    results.append({
+                        'symbol': quote.get('symbol', ''),
+                        'name': quote.get('longname') or quote.get('shortname', ''),
+                        'exchange': quote.get('exchange', ''),
+                        'type': quote.get('quoteType', '')
+                    })
 
-        _cache.set(cache_key, results, _TTL_SEARCH)
-        return results
-    except Exception as e:
-        print(f"Error searching tickers: {e}")
+            _cache.set(cache_key, results, _TTL_SEARCH)
+            return results
+        except Exception as e:
+            if _YFRateLimitError and isinstance(e, _YFRateLimitError):
+                _on_rate_limited()
+                continue
+            print(f"Error searching tickers: {e}")
         return []
+
+
+def get_earnings_date(ticker: str) -> str | None:
+    """Return the next upcoming earnings date as 'YYYY-MM-DD', or None.
+
+    Uses only stock.calendar (lighter than stock.info).  Cached for 24 hours
+    because earnings dates are announced well in advance and rarely change.
+    """
+    import datetime as _dt
+
+    cache_key = ('get_earnings_date', ticker.upper())
+    cached, hit = _cache.get(cache_key)
+    if hit:
+        return cached
+
+    # If a full stock-info fetch already has the date, use it without another call.
+    info_cached, info_hit = _cache.get(('get_stock_info', ticker.upper()))
+    if info_hit and info_cached.get('success') and info_cached.get('earnings_date'):
+        result = info_cached['earnings_date']
+        _cache.set(cache_key, result, _TTL_EARNINGS)
+        return result
+
+    _yf_rate_limit()
+    for _attempt in range(3):
+        try:
+            cal = yf.Ticker(ticker).calendar
+            result = None
+            if cal is not None and 'Earnings Date' in cal:
+                dates = cal['Earnings Date']
+                if dates and len(dates) > 0:
+                    ed = dates[0]
+                    result = (
+                        ed.strftime('%Y-%m-%d') if isinstance(ed, _dt.date) else str(ed)[:10]
+                    )
+            _cache.set(cache_key, result, _TTL_EARNINGS)
+            return result
+        except Exception as _exc:
+            if _YFRateLimitError and isinstance(_exc, _YFRateLimitError):
+                _on_rate_limited()
+                continue
+            _cache.set(cache_key, None, 60)   # cache failures briefly
+            return None
+    _cache.set(cache_key, None, 60)
+    return None
 
 
 def get_stock_info(ticker):
@@ -174,10 +250,22 @@ def get_stock_info(ticker):
         return cached
 
     _yf_rate_limit()
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
+    # Retry up to 3 times on rate-limit; any other exception fails immediately.
+    info = None
+    for _attempt in range(3):
+        try:
+            stock = yf.Ticker(ticker)
+            info  = stock.info
+            break
+        except Exception as _exc:
+            if _YFRateLimitError and isinstance(_exc, _YFRateLimitError):
+                _on_rate_limited()
+                continue   # retry after sleeping
+            return {'ticker': ticker, 'success': False, 'error': str(_exc)}
+    else:
+        return {'ticker': ticker, 'success': False, 'error': 'Rate limit retries exhausted'}
 
+    try:
         # Get current price — discard implausible values from yfinance
         _raw_price = info.get('currentPrice') or info.get('regularMarketPrice') or info.get('previousClose')
         current_price = float(_raw_price) if (_raw_price is not None and 0.01 <= float(_raw_price) <= 1_000_000) else None

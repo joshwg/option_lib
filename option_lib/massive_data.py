@@ -205,15 +205,6 @@ def get_stock_info(ticker: str) -> dict:
         except Exception:
             pass
 
-        # 4) Earnings date - not available in Massive; fall back to Yahoo
-        earnings_date = None
-        try:
-            yi = _yahoo.get_stock_info(ticker)
-            if yi.get("success"):
-                earnings_date = yi.get("earnings_date")
-        except Exception:
-            pass
-
         result = {
             "ticker":             ticker,
             "current_price":      current_price,
@@ -223,7 +214,7 @@ def get_stock_info(ticker: str) -> dict:
             "avg_volume":         avg_volume,
             "market_cap":         market_cap,
             "dividend_yield":     dividend_yield,
-            "earnings_date":      earnings_date,
+            "earnings_date":      None,   # fetched separately via get_earnings_date()
             "pre_market_price":   pre_market_price,
             "post_market_price":  post_market_price,
             "success":            True,
@@ -238,6 +229,18 @@ def get_stock_info(ticker: str) -> dict:
         if result.get("success"):
             result["_source"] = "yahoo_fallback"
         return result
+
+
+# ── Earnings date ─────────────────────────────────────────────────────────────
+
+def get_earnings_date(ticker: str) -> str | None:
+    """Next upcoming earnings date as 'YYYY-MM-DD', or None.
+
+    Massive/Polygon has no upcoming-earnings endpoint, so this always delegates
+    to yahoo_data.get_earnings_date() which uses stock.calendar (lighter than
+    stock.info) and caches the result for 24 hours.
+    """
+    return _yahoo.get_earnings_date(ticker)
 
 
 # ── Historical volatility ──────────────────────────────────────────────────────
