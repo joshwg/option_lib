@@ -1,4 +1,5 @@
 import math
+import threading
 import time
 from datetime import datetime
 from option_lib import pricing as _pricing
@@ -20,22 +21,26 @@ class TTLCache:
 
     def __init__(self):
         self._store: dict = {}
+        self._lock = threading.Lock()
 
     def get(self, key):
-        entry = self._store.get(key)
-        if entry is None:
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                return None, False
+            value, expires_at = entry
+            if time.monotonic() < expires_at:
+                return value, True
+            del self._store[key]
             return None, False
-        value, expires_at = entry
-        if time.monotonic() < expires_at:
-            return value, True
-        del self._store[key]
-        return None, False
 
     def set(self, key, value, ttl):
-        self._store[key] = (value, time.monotonic() + ttl)
+        with self._lock:
+            self._store[key] = (value, time.monotonic() + ttl)
 
     def invalidate(self, key):
-        self._store.pop(key, None)
+        with self._lock:
+            self._store.pop(key, None)
 
 
 def iv_from_mid(bid, ask, S, K, T, r, option_type):
@@ -67,7 +72,7 @@ def next_option_friday() -> 'date':
         days = 7
     elif wd == 5:             # Saturday
         days = 6
-    else:                     # Sun(6) through Thu(0–3)
+    else:                     # Sun(6) and Mon–Thu(0–3)
         days = (4 - wd) % 7
     return today + timedelta(days=days)
 

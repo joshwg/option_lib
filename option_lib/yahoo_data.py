@@ -187,7 +187,7 @@ def search_ticker(query, max_results=10):
                 _on_rate_limited()
                 continue
             print(f"Error searching tickers: {e}")
-        return []
+    return []
 
 
 def get_earnings_date(ticker: str) -> str | None:
@@ -290,14 +290,14 @@ def get_stock_info(ticker):
                         earnings_date = earnings_dt.strftime('%Y-%m-%d')
                     elif isinstance(earnings_dt, str):
                         earnings_date = earnings_dt
-        except:
+        except Exception:
             # If calendar fails, try the info dict
             try:
                 earnings_timestamp = info.get('earningsTimestamp')
                 if earnings_timestamp:
                     import datetime as dt
                     earnings_date = dt.datetime.fromtimestamp(earnings_timestamp).strftime('%Y-%m-%d')
-            except:
+            except Exception:
                 pass
 
         avg_volume = (
@@ -377,7 +377,7 @@ def calculate_historical_volatility(ticker, period='1y', days=None):
             return None
 
         log_returns = np.log(hist['Close'] / hist['Close'].shift(1))
-        volatility = log_returns.std() * np.sqrt(252)  # 252 trading days per year
+        volatility = float(log_returns.std() * np.sqrt(252))  # 252 trading days per year
 
         _cache.set(cache_key, volatility, _TTL_VOL)
         return volatility
@@ -449,8 +449,8 @@ def get_option_chain_next_months(ticker, months=6):
         now_et = datetime.now(eastern)
         market_close_hour = 16  # 4 PM ET
 
-        # Filter to next N months
-        today = datetime.now()
+        # Filter to next N months (use ET date throughout for consistency)
+        today = now_et
         cutoff_date = today + timedelta(days=months * 30)
 
         filtered_expirations = []
@@ -772,20 +772,10 @@ def fetch_option_theta(symbol: str, expiration_iso: str, strike: float,
         q = info.get('dividend_yield', 0) or 0
         T = get_years_to_expiration(expiration_iso)
         if T <= 0:
-            # Expiration day: theta = remaining time value = market_price - intrinsic
-            options = get_options_for_expiration(symbol, expiration_iso)
-            if not options['success']:
-                return None
-            chain = options['calls'] if side == 'call' else options['puts']
-            best_match = min(chain, key=lambda o: abs(o['strike'] - strike), default=None)
-            if best_match is None:
-                return None
-            bid, ask = best_match['bid'], best_match['ask']
-            if bid <= 0 or ask <= 0:
-                return None
-            mid = (bid + ask) / 2.0
-            intrinsic = max(S - strike, 0.0) if side == 'call' else max(strike - S, 0.0)
-            return -(mid - intrinsic)
+            # Expiration day: no future time value remains, so theta is 0.
+            # The chain is likely stale or empty at this point, and attempting
+            # to derive theta from bid/ask mid on expiration day is unreliable.
+            return 0.0
         iv = get_implied_volatility_for_strike(symbol, expiration_iso, strike, option_type=side, S=S, r=r)
         if not iv:
             return None

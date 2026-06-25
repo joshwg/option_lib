@@ -105,13 +105,11 @@ def calculate_greeks(S, K, T, r, sigma, option_type='call'):
     dict: Dictionary containing Greeks (delta, gamma, theta, vega, rho)
     """
     if T <= 0:
-        return {
-            'delta': 1.0 if S > K else 0.0,
-            'gamma': 0.0,
-            'theta': 0.0,
-            'vega': 0.0,
-            'rho': 0.0
-        }
+        if option_type == 'call':
+            delta = 1.0 if S > K else 0.0
+        else:
+            delta = -1.0 if S < K else 0.0
+        return {'delta': delta, 'gamma': 0.0, 'theta': 0.0, 'vega': 0.0, 'rho': 0.0}
 
     d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
     d2 = d1 - sigma * np.sqrt(T)
@@ -287,7 +285,8 @@ def american_option_greeks(S, K, T, r, sigma, q=0, option_type='call', steps=100
     """
     if T <= 0:
         delta = (1.0 if S > K else 0.0) if option_type == 'call' else (-1.0 if S < K else 0.0)
-        return {'delta': delta, 'gamma': 0.0, 'theta': 0.0, 'vega': 0.0}
+        price = max(S - K, 0.0) if option_type == 'call' else max(K - S, 0.0)
+        return {'price': price, 'delta': delta, 'gamma': 0.0, 'theta': 0.0, 'vega': 0.0}
 
     price_0 = american_option_binomial(S, K, T, r, sigma, q, option_type, steps)
 

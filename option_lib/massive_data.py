@@ -18,7 +18,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import numpy as np
 import pytz
@@ -75,14 +75,26 @@ _MASSIVE_MAX_PER_SEC = 50
 
 
 def _massive_rate_limit() -> None:
-    """Block until the next Massive API call is within the 50 req/s budget."""
-    with _rl_lock:
-        now = time.monotonic()
-        if len(_rl_times) == _MASSIVE_MAX_PER_SEC:
+    """Block until the next Massive API call is within the 50 req/s budget.
+
+    The lock is released while sleeping so other threads can progress
+    independently (e.g. hit the cache) rather than queuing behind a
+    potentially 1-second hold.  After waking we re-acquire and re-check
+    the window, because another thread may have consumed a slot while we
+    were asleep.
+    """
+    while True:
+        with _rl_lock:
+            now = time.monotonic()
+            if len(_rl_times) < _MASSIVE_MAX_PER_SEC:
+                _rl_times.append(now)
+                return
             wait = 1.0 - (now - _rl_times[0])
-            if wait > 0:
-                time.sleep(wait)
-        _rl_times.append(time.monotonic())
+            if wait <= 0:
+                _rl_times.append(time.monotonic())
+                return
+        # Release lock before sleeping so unrelated threads aren't blocked.
+        time.sleep(wait)
 
 
 def _get(path: str, params: dict | None = None, *, full_url: str = "") -> dict:
@@ -308,7 +320,7 @@ def _fetch_option_snapshot(ticker: str) -> list:
     all_results = []
     path        = f"/v3/snapshot/options/{ticker.upper()}"
     params      = {"limit": 250}
-    follow_url  = ""
+    follow_url: str = ""
     MAX_PAGES   = 25
 
     for _ in range(MAX_PAGES):
@@ -324,12 +336,14 @@ def _fetch_option_snapshot(ticker: str) -> list:
         if not next_url:
             break
 
-        # Follow pagination - strip apiKey, keep cursor
+        # Follow pagination: rebuild the cursor URL without apiKey (auth is via
+        # header) and pass no separate params — they are already embedded in the
+        # URL, so passing them again via requests' params= would duplicate them.
         parsed     = urlparse(next_url)
-        path       = parsed.path
-        params     = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-        follow_url = next_url
-        params.pop("apiKey", None)
+        clean_qs   = {k: v[0] for k, v in parse_qs(parsed.query).items()
+                      if k != "apiKey"}
+        follow_url = urlunparse(parsed._replace(query=urlencode(clean_qs)))
+        params     = {}    # all params are in follow_url; path is unused
 
     _cache.set(cache_key, all_results, _TTL_OPTIONS)
     return all_results
@@ -385,7 +399,7 @@ def get_option_chain_next_months(ticker: str, months: int = 6) -> dict:
 
         eastern = pytz.timezone("US/Eastern")
         now_et  = datetime.now(eastern)
-        today   = datetime.now()
+        today   = now_et          # use ET date throughout for consistency
         cutoff  = today + timedelta(days=months * 30)
 
         filtered = []
@@ -632,19 +646,11 @@ def fetch_option_theta(
         q = info.get("dividend_yield", 0) or 0
         T = get_years_to_expiration(expiration_iso)
         if T <= 0:
-            options = get_options_for_expiration(symbol, expiration_iso)
-            if not options.get("success"):
-                return None
-            chain = options["calls"] if side == "call" else options["puts"]
-            best  = min(chain, key=lambda o: abs(o["strike"] - strike), default=None)
-            if best is None:
-                return None
-            bid, ask = best["bid"], best["ask"]
-            if bid <= 0 or ask <= 0:
-                return None
-            mid       = (bid + ask) / 2.0
-            intrinsic = max(S - strike, 0.0) if side == "call" else max(strike - S, 0.0)
-            return -(mid - intrinsic)
+            # Expiration day: no future time value remains, so theta is 0.
+            # Querying the chain here would likely return stale/empty data, and
+            # any exception would fall back to _yahoo.fetch_option_theta which
+            # has the same limitation — so handle analytically instead.
+            return 0.0
         iv = get_implied_volatility_for_strike(
             symbol, expiration_iso, strike, option_type=side, S=S, r=r
         )
@@ -665,6 +671,8 @@ def search_ticker(query: str, max_results: int = 10) -> list:
 
 def get_stock_data(ticker: str) -> dict | None:
     """Kivy-compatible variant — returns raw stock dict or None on failure."""
+    if not _is_key_set():
+        return _yahoo.get_stock_data(ticker)
     result = get_stock_info(ticker)
     if not result.get("success"):
         return None
@@ -679,6 +687,8 @@ def get_stock_data(ticker: str) -> dict | None:
 
 
 def get_dividend_yield(ticker: str) -> float:
+    if not _is_key_set():
+        return _yahoo.get_dividend_yield(ticker)
     result = get_stock_info(ticker)
     return result.get("dividend_yield", 0)
 
