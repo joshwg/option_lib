@@ -364,24 +364,7 @@ _announced_provider: str | None = None   # tracks last-printed provider name
 
 
 def get_provider() -> DataProvider:
-    """Return the active DataProvider.
+    """Return the active DataProvider instance via option_lib.fin_data.get_provider()."""
+    from option_lib import fin_data
+    return fin_data.get_provider()
 
-    Selects MassiveDataProvider when the MASSIVE_API_KEY environment variable
-    is set; falls back to YahooDataProvider otherwise.
-
-    The check is performed at call time so the key can be injected after import
-    (e.g. via dotenv or test fixtures) without restarting the process.
-
-    Prints a one-time console message whenever the active provider changes.
-    """
-    global _announced_provider
-    if os.environ.get("MASSIVE_API_KEY"):
-        if _announced_provider != "massive":
-            print("Pricing data: Massive.com  (MASSIVE_API_KEY set)")
-            _announced_provider = "massive"
-        return MassiveDataProvider()
-    else:
-        if _announced_provider != "yahoo":
-            print("Pricing data: Yahoo Finance  (set MASSIVE_API_KEY to use Massive.com)")
-            _announced_provider = "yahoo"
-        return YahooDataProvider()

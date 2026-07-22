@@ -61,9 +61,13 @@ def iv_from_mid(bid, ask, S, K, T, r, option_type):
 def next_option_friday() -> 'date':
     """Return the default option-expiration Friday.
 
-    Sun–Thu  → this coming Friday.
+    Always returns *next* week's Friday so the form never defaults to the
+    current week's expiry.
+
+    Mon–Thu  → next week's Friday (skip this week).
     Fri      → next week's Friday (skip today, it's already expiry day).
     Sat      → next week's Friday (this week's has already passed).
+    Sun      → next Friday (5 days out, already next week).
     """
     from datetime import date, timedelta
     today = date.today()
@@ -72,8 +76,10 @@ def next_option_friday() -> 'date':
         days = 7
     elif wd == 5:             # Saturday
         days = 6
-    else:                     # Sun(6) and Mon–Thu(0–3)
-        days = (4 - wd) % 7
+    elif wd == 6:             # Sunday → next Friday (already next week)
+        days = 5
+    else:                     # Mon–Thu: skip to next week's Friday
+        days = 4 - wd + 7
     return today + timedelta(days=days)
 
 

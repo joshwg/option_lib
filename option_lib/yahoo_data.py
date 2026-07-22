@@ -191,11 +191,7 @@ def search_ticker(query, max_results=10):
 
 
 def get_earnings_date(ticker: str) -> str | None:
-    """Return the next upcoming earnings date as 'YYYY-MM-DD', or None.
-
-    Uses only stock.calendar (lighter than stock.info).  Cached for 24 hours
-    because earnings dates are announced well in advance and rarely change.
-    """
+    """Return the next upcoming earnings date as 'YYYY-MM-DD', or None via Yahoo Finance (stock.calendar). Cached for 24 hours."""
     import datetime as _dt
 
     cache_key = ('get_earnings_date', ticker.upper())
