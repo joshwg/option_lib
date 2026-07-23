@@ -6,7 +6,7 @@ Fetches earnings calendar data from Finnhub.io API.
 
 import os
 import requests
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from option_lib.math_util import TTLCache
 
 _cache = TTLCache()
@@ -29,7 +29,14 @@ def get_earnings_date(ticker: str) -> str | None:
     if hit:
         return cached
 
-    url = f"https://finnhub.io/api/v1/calendar/earnings?symbol={ticker_upper}&token={api_key}"
+    today = date.today()
+    today_str = today.strftime("%Y-%m-%d")
+    future_str = (today + timedelta(days=365)).strftime("%Y-%m-%d")
+
+    url = (
+        f"https://finnhub.io/api/v1/calendar/earnings"
+        f"?symbol={ticker_upper}&from={today_str}&to={future_str}&token={api_key}"
+    )
     try:
         resp = requests.get(url, timeout=10)
         if resp.status_code != 200:
@@ -39,7 +46,7 @@ def get_earnings_date(ticker: str) -> str | None:
         data = resp.json()
         calendar = data.get("earningsCalendar", [])
         if not calendar or not isinstance(calendar, list):
-            _cache.set(cache_key, None, _TTL_EARNINGS)
+            _cache.set(cache_key, None, 120)  # Short TTL for empty responses
             return None
 
         today = date.today()
@@ -62,12 +69,18 @@ def get_earnings_date(ticker: str) -> str | None:
             _cache.set(cache_key, result, _TTL_EARNINGS)
             return result
 
-        _cache.set(cache_key, None, _TTL_EARNINGS)
+        _cache.set(cache_key, None, 120)  # Short TTL for empty future dates
         return None
 
     except Exception:
         _cache.set(cache_key, None, 60)
         return None
+
+
+def clear_cache():
+    """Clear all in-memory TTLCache entries for finnhub_data."""
+    _cache.clear()
+
 
 
 class FinnhubDataProvider:
