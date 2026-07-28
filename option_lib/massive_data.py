@@ -146,6 +146,38 @@ def _get_daily_bars(ticker: str, lookback_days: int = 400) -> list:
         return []
 
 
+def get_daily_bars_range(ticker: str, from_date: str, to_date: str) -> list:
+    """Adjusted daily bars for an explicit [from_date, to_date] window (ISO strings).
+
+    Unlike _get_daily_bars() (trailing lookback only), this fetches an arbitrary
+    historical range — the entitled equities aggregates endpoint.  Each bar dict
+    carries at least {'t': epoch_ms, 'o','h','l','c','v'}.  Cached for _TTL_BARS.
+
+    Returns [] when MASSIVE_API_KEY is absent or on any error (no Yahoo fallback:
+    yfinance cannot serve adjusted daily history for arbitrary past ranges the
+    same way, so callers should treat [] as "unavailable" explicitly).
+    """
+    if not _is_key_set():
+        return []
+
+    cache_key = ("massive_bars_range", ticker.upper(), from_date, to_date)
+    cached, hit = _cache.get(cache_key)
+    if hit:
+        return cached
+
+    try:
+        resp = _get(
+            f"/v2/aggs/ticker/{ticker.upper()}/range/1/day/{from_date}/{to_date}",
+            {"adjusted": "true", "sort": "asc", "limit": 50000},
+        )
+        bars = resp.get("results") or []
+        _cache.set(cache_key, bars, _TTL_BARS)
+        return bars
+    except Exception as e:
+        print(f"Massive: error fetching range bars for {ticker} [{from_date}..{to_date}]: {e}")
+        return []
+
+
 # ── Stock info ─────────────────────────────────────────────────────────────────
 
 def get_stock_info(ticker: str) -> dict:
