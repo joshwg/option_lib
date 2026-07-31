@@ -205,20 +205,29 @@ def get_stock_info(ticker: str) -> dict:
         min_bar = t.get("min") or {}
         prev_day = t.get("prevDay") or {}
 
-        current_price = _safe_float(day.get("c") or min_bar.get("c") or prev_day.get("c"))
+        # Regular-session price only.  Before the open day.c is 0 and min.c holds a
+        # pre-market print — falling back to it there would silently report an
+        # extended-hours price as the regular one, so use the prior close instead
+        # (matches Yahoo's regularMarketPrice).  Extended prices are exposed
+        # separately below and selected by the caller via use_extended.
+        current_price = _safe_float(day.get("c") or prev_day.get("c") or min_bar.get("c"))
         volume = _safe_float(day.get("v") or prev_day.get("v"), 0)
         prev_close = _safe_float(prev_day.get("c"))
 
-        # Extended-hours prices — Polygon surfaces these directly on the snapshot.
-        # Fall back to the last-minute bar when it differs from the regular close
-        # (covers providers that don't populate the explicit fields).
+        # Extended-hours prices.  The ticker-snapshot endpoint carries no explicit
+        # preMarket/afterHours fields (those live on /v1/open-close), so derive the
+        # session from the last-minute bar relative to the regular-session day bar:
+        #   day.c == 0        -> regular session hasn't opened yet, min.c is pre-market
+        #   min.c != day.c    -> a trade after the close, min.c is post-market
         pre_market_price  = _safe_float(t.get("preMarket"))
         post_market_price = _safe_float(t.get("afterHours"))
         if not pre_market_price and not post_market_price:
             _min_c = _safe_float(min_bar.get("c"))
             _day_c = _safe_float(day.get("c"))
-            if _min_c and _day_c and abs(_min_c - _day_c) > 0.001:
-                post_market_price = _min_c   # most recent trade; direction unknown
+            if _min_c and not _day_c:
+                pre_market_price = _min_c
+            elif _min_c and _day_c and abs(_min_c - _day_c) > 0.001:
+                post_market_price = _min_c
 
         # 2) Reference data - name, market cap, dividend yield
         market_cap     = None
