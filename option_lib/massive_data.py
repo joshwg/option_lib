@@ -97,6 +97,37 @@ def _massive_rate_limit() -> None:
         time.sleep(wait)
 
 
+# ── Entitlement backoff ────────────────────────────────────────────────────────
+# A 401/403 NOT_AUTHORIZED means the account's plan does not cover an endpoint.
+# Retrying every call wastes a round-trip (and a rate-limit slot) per ticker per
+# cache period, but the condition is not permanent either — a plan upgrade should
+# be picked up without a restart.  So park the endpoint for _ENTITLEMENT_BACKOFF
+# seconds, then let one probe through.
+
+_ENTITLEMENT_BACKOFF = int(os.environ.get("MASSIVE_ENTITLEMENT_BACKOFF", 7200))   # 2 h
+
+_ent_lock = threading.Lock()
+_ent_blocked_until: dict[str, float] = {}   # feature name -> monotonic deadline
+
+
+def _entitlement_blocked(feature: str) -> bool:
+    """True while *feature* is parked after a NOT_AUTHORIZED response."""
+    with _ent_lock:
+        return time.monotonic() < _ent_blocked_until.get(feature, 0.0)
+
+
+def _note_entitlement_failure(feature: str, exc: Exception) -> bool:
+    """Park *feature* if *exc* is a 401/403.  Returns True when it was parked."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status not in (401, 403):
+        return False
+    with _ent_lock:
+        _ent_blocked_until[feature] = time.monotonic() + _ENTITLEMENT_BACKOFF
+    print(f"Massive: not entitled to {feature} ({status}) — using Yahoo fallback, "
+          f"retrying in {_ENTITLEMENT_BACKOFF // 60} min")
+    return True
+
+
 def _get(path: str, params: dict | None = None, *, full_url: str = "") -> dict:
     """Authenticated GET to Massive API.  Use full_url when following next_url."""
     _massive_rate_limit()
@@ -113,6 +144,38 @@ def _is_key_set() -> bool:
     return bool(os.environ.get("MASSIVE_API_KEY", ""))
 
 
+_MARKET_TZ = pytz.timezone("US/Eastern")
+
+
+def _market_session(now=None) -> str:
+    """Which US equity session the clock is in: 'pre', 'regular', 'post', 'closed'.
+
+    Boundaries are the standard ET windows: 04:00 pre, 09:30 regular, 16:00 post,
+    20:00 closed.  Holidays are not tracked — a holiday reads as whatever window
+    the clock falls in, but no extended-hours print exists then so callers simply
+    see the regular price.
+    """
+    now = now or datetime.now(_MARKET_TZ)
+    if now.weekday() >= 5:
+        return "closed"
+    hm = now.hour * 60 + now.minute
+    if 4 * 60 <= hm < 9 * 60 + 30:
+        return "pre"
+    if 9 * 60 + 30 <= hm < 16 * 60:
+        return "regular"
+    if 16 * 60 <= hm < 20 * 60:
+        return "post"
+    return "closed"
+
+
+def _yahoo_stock_info(ticker: str) -> dict:
+    """yahoo_data.get_stock_info() tagged so callers can see the source swapped."""
+    result = _yahoo.get_stock_info(ticker)
+    if result.get("success"):
+        result["_source"] = "yahoo_fallback"
+    return result
+
+
 # ── Pure-math helpers (identical to yahoo_data) ────────────────────────────────
 
 
@@ -126,6 +189,9 @@ def _get_daily_bars(ticker: str, lookback_days: int = 400) -> list:
     Returns list of bar dicts with at least {'c': close, 'v': volume}.
     Cached for _TTL_BARS seconds.  Returns [] on any error.
     """
+    if _entitlement_blocked("equity aggregates"):
+        return []
+
     cache_key = ("massive_bars", ticker.upper(), lookback_days)
     cached, hit = _cache.get(cache_key)
     if hit:
@@ -142,7 +208,8 @@ def _get_daily_bars(ticker: str, lookback_days: int = 400) -> list:
         _cache.set(cache_key, bars, _TTL_BARS)
         return bars
     except Exception as e:
-        print(f"Massive: error fetching daily bars for {ticker}: {e}")
+        if not _note_entitlement_failure("equity aggregates", e):
+            print(f"Massive: error fetching daily bars for {ticker}: {e}")
         return []
 
 
@@ -157,7 +224,7 @@ def get_daily_bars_range(ticker: str, from_date: str, to_date: str) -> list:
     yfinance cannot serve adjusted daily history for arbitrary past ranges the
     same way, so callers should treat [] as "unavailable" explicitly).
     """
-    if not _is_key_set():
+    if not _is_key_set() or _entitlement_blocked("equity aggregates"):
         return []
 
     cache_key = ("massive_bars_range", ticker.upper(), from_date, to_date)
@@ -174,7 +241,8 @@ def get_daily_bars_range(ticker: str, from_date: str, to_date: str) -> list:
         _cache.set(cache_key, bars, _TTL_BARS)
         return bars
     except Exception as e:
-        print(f"Massive: error fetching range bars for {ticker} [{from_date}..{to_date}]: {e}")
+        if not _note_entitlement_failure("equity aggregates", e):
+            print(f"Massive: error fetching range bars for {ticker} [{from_date}..{to_date}]: {e}")
         return []
 
 
@@ -186,8 +254,8 @@ def get_stock_info(ticker: str) -> dict:
     Returned dict keys match yahoo_data.get_stock_info() plus:
       avg_volume  - 63-trading-day (~3 month) average volume
     """
-    if not _is_key_set():
-        return _yahoo.get_stock_info(ticker)
+    if not _is_key_set() or _entitlement_blocked("equity snapshots"):
+        return _yahoo_stock_info(ticker)
 
     cache_key = ("massive_stock_info", ticker.upper())
     cached, hit = _cache.get(cache_key)
@@ -215,37 +283,43 @@ def get_stock_info(ticker: str) -> dict:
         prev_close = _safe_float(prev_day.get("c"))
 
         # Extended-hours prices.  The ticker-snapshot endpoint carries no explicit
-        # preMarket/afterHours fields (those live on /v1/open-close), so derive the
-        # session from the last-minute bar relative to the regular-session day bar:
-        #   day.c == 0        -> regular session hasn't opened yet, min.c is pre-market
-        #   min.c != day.c    -> a trade after the close, min.c is post-market
+        # preMarket/afterHours fields (those live on /v1/open-close), so fall back
+        # to min.c — the last one-minute bar, which outside regular hours is the
+        # most recent extended-hours print.
+        #
+        # The session must come from the clock, not from comparing min.c to day.c:
+        # intraday those two differ by a tick or two simply because the minute bar
+        # lags the day bar, which would misreport every open market as after-hours.
         pre_market_price  = _safe_float(t.get("preMarket"))
         post_market_price = _safe_float(t.get("afterHours"))
         if not pre_market_price and not post_market_price:
-            _min_c = _safe_float(min_bar.get("c"))
-            _day_c = _safe_float(day.get("c"))
-            if _min_c and not _day_c:
+            _min_c   = _safe_float(min_bar.get("c"))
+            _session = _market_session()
+            if _min_c and _session == "pre":
                 pre_market_price = _min_c
-            elif _min_c and _day_c and abs(_min_c - _day_c) > 0.001:
+            elif _min_c and _session == "post":
                 post_market_price = _min_c
 
         # 2) Reference data - name, market cap, dividend yield
         market_cap     = None
         company_name   = ticker
         dividend_yield = 0.0
-        try:
-            ref = _get(f"/v3/reference/tickers/{ticker.upper()}")
-            r   = ref.get("results") or {}
-            if r:
-                company_name = r.get("name", ticker)
-                market_cap   = _safe_float(r.get("market_cap"))
-                div_raw      = _safe_float(r.get("dividend_yield"))
-                if div_raw and div_raw > 0.10:
-                    dividend_yield = div_raw / 100   # pct to decimal
-                elif div_raw:
-                    dividend_yield = div_raw
-        except Exception:
-            pass  # non-fatal; continue with partial data
+        if not _entitlement_blocked("ticker reference"):
+            try:
+                ref = _get(f"/v3/reference/tickers/{ticker.upper()}")
+                r   = ref.get("results") or {}
+                if r:
+                    company_name = r.get("name", ticker)
+                    market_cap   = _safe_float(r.get("market_cap"))
+                    div_raw      = _safe_float(r.get("dividend_yield"))
+                    if div_raw and div_raw > 0.10:
+                        dividend_yield = div_raw / 100   # pct to decimal
+                    elif div_raw:
+                        dividend_yield = div_raw
+            except Exception as e:
+                # Non-fatal; continue with partial data.  Park on 401/403 so an
+                # unentitled plan doesn't re-request reference data every time.
+                _note_entitlement_failure("ticker reference", e)
 
         # 3) Average 3-month volume from cached bars (~100 calendar days = ~63 trading days)
         avg_volume = volume  # safe fallback
@@ -278,10 +352,8 @@ def get_stock_info(ticker: str) -> dict:
 
     except Exception as e:
         # Full fallback to yahoo_data
-        result = _yahoo.get_stock_info(ticker)
-        if result.get("success"):
-            result["_source"] = "yahoo_fallback"
-        return result
+        _note_entitlement_failure("equity snapshots", e)
+        return _yahoo_stock_info(ticker)
 
 
 # ── Earnings date ─────────────────────────────────────────────────────────────
@@ -351,8 +423,12 @@ def _fetch_option_snapshot(ticker: str) -> list:
 
     Follows next_url pagination automatically (up to 25 pages).
     Result is cached for _TTL_OPTIONS seconds.
-    Returns [] on any error.
+    Returns [] on any error, including while the endpoint is parked after a
+    NOT_AUTHORIZED response — callers treat [] as "fall back to Yahoo".
     """
+    if _entitlement_blocked("option snapshots"):
+        return []
+
     cache_key = ("massive_snapshot", ticker.upper())
     cached, hit = _cache.get(cache_key)
     if hit:
@@ -368,7 +444,8 @@ def _fetch_option_snapshot(ticker: str) -> list:
         try:
             resp = _get(path, params, full_url=follow_url)
         except Exception as e:
-            print(f"Massive: error fetching option snapshot for {ticker}: {e}")
+            if not _note_entitlement_failure("option snapshots", e):
+                print(f"Massive: error fetching option snapshot for {ticker}: {e}")
             break
 
         all_results.extend(resp.get("results") or [])
