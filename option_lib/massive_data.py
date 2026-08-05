@@ -32,6 +32,8 @@ from option_lib.math_util import (
     iv_from_mid as _iv_from_mid,
     get_days_to_expiration,
     get_years_to_expiration,
+    market_session as _market_session,
+    extended_underlying as _extended_underlying,
 )
 
 
@@ -144,28 +146,8 @@ def _is_key_set() -> bool:
     return bool(os.environ.get("MASSIVE_API_KEY", ""))
 
 
-_MARKET_TZ = pytz.timezone("US/Eastern")
-
-
-def _market_session(now=None) -> str:
-    """Which US equity session the clock is in: 'pre', 'regular', 'post', 'closed'.
-
-    Boundaries are the standard ET windows: 04:00 pre, 09:30 regular, 16:00 post,
-    20:00 closed.  Holidays are not tracked — a holiday reads as whatever window
-    the clock falls in, but no extended-hours print exists then so callers simply
-    see the regular price.
-    """
-    now = now or datetime.now(_MARKET_TZ)
-    if now.weekday() >= 5:
-        return "closed"
-    hm = now.hour * 60 + now.minute
-    if 4 * 60 <= hm < 9 * 60 + 30:
-        return "pre"
-    if 9 * 60 + 30 <= hm < 16 * 60:
-        return "regular"
-    if 16 * 60 <= hm < 20 * 60:
-        return "post"
-    return "closed"
+# Session windows live in math_util so this module and yahoo_data classify the
+# clock identically — see math_util.market_session() for the boundaries.
 
 
 def _yahoo_stock_info(ticker: str) -> dict:
@@ -799,11 +781,7 @@ def fetch_option_greeks(
         info = get_stock_info(symbol)
         if not info.get("success"):
             return _none
-        if use_extended:
-            S = (info.get("post_market_price") or info.get("pre_market_price")
-                 or info.get("current_price"))
-        else:
-            S = info.get("current_price")
+        S = _extended_underlying(info) if use_extended else info.get("current_price")
         if not S:
             return _none
         q = info.get("dividend_yield", 0) or 0

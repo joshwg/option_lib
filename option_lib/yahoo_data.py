@@ -27,6 +27,7 @@ from option_lib.math_util import (
     iv_from_mid as _iv_from_mid,
     get_days_to_expiration,
     get_years_to_expiration,
+    extended_underlying as _extended_underlying,
 )
 
 _cache = _TTLCache()
@@ -861,9 +862,11 @@ def fetch_option_greeks(symbol: str, expiration_iso: str, strike: float,
       - Fetches IV once          (vs 3x, using a targeted single-contract quote)
       - Runs the binomial tree 5 times (vs 11x: 1 + 5 + 5)
 
-    When use_extended=True, prefers post-market then pre-market price as S so
-    that $/shr, theta, and delta are all computed against the extended-hours
-    underlying price rather than the regular-session close.
+    When use_extended=True, S is the price for the session the clock is in —
+    pre-market from 04:00, post-market from 16:00 through to 04:00 — so $/shr,
+    theta, and delta all reflect the extended-hours underlying rather than the
+    regular-session close.  Falls back to the regular price when that session
+    has no print of its own.
 
     Returns:
     dict with keys 'price', 'theta', 'delta'; any value may be None on failure.
@@ -874,11 +877,7 @@ def fetch_option_greeks(symbol: str, expiration_iso: str, strike: float,
         info = get_stock_info(symbol)
         if not info.get('success'):
             return _none
-        if use_extended:
-            S = (info.get('post_market_price') or info.get('pre_market_price')
-                 or info.get('current_price'))
-        else:
-            S = info.get('current_price')
+        S = _extended_underlying(info) if use_extended else info.get('current_price')
         if not S:
             return _none
         q = info.get('dividend_yield', 0) or 0
