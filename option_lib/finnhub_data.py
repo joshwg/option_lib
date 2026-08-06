@@ -107,12 +107,15 @@ class FinnhubDataProvider:
     def get_days_to_expiration(self, expiration_date_str: str) -> int:
         if self.fallback_provider:
             return self.fallback_provider.get_days_to_expiration(expiration_date_str)
-        from datetime import datetime, date
-        exp = datetime.strptime(expiration_date_str, "%Y-%m-%d").date()
-        return max(0, (exp - date.today()).days)
+        from option_lib.math_util import get_days_to_expiration
+        return get_days_to_expiration(expiration_date_str)
 
     def get_years_to_expiration(self, expiration_date_str: str) -> float:
-        return self.get_days_to_expiration(expiration_date_str) / 365.0
+        if self.fallback_provider:
+            return self.fallback_provider.get_years_to_expiration(expiration_date_str)
+        # Not days/365: T must count the hours left to the 16:00 ET close.
+        from option_lib.math_util import get_years_to_expiration
+        return get_years_to_expiration(expiration_date_str)
 
     def get_stock_info(self, ticker: str) -> dict:
         if self.fallback_provider:

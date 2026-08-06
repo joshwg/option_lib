@@ -6,6 +6,7 @@ Calculates option prices and Greeks using multiple models:
 """
 
 import numpy as np
+from scipy.optimize import brentq
 from scipy.stats import norm
 
 
@@ -149,9 +150,24 @@ def calculate_greeks(S, K, T, r, sigma, option_type='call'):
     }
 
 
+# Search bracket for implied_volatility(). 600% covers 0-DTE meme-stock and
+# earnings-day vols; below 0.01% the option is worth its discounted intrinsic.
+IV_SEARCH_MIN = 1e-4
+IV_SEARCH_MAX = 6.0
+
+
 def implied_volatility(option_price, S, K, T, r, option_type='call', max_iterations=100, tolerance=1e-5):
     """
-    Calculate implied volatility using Newton-Raphson method
+    Calculate implied volatility by bracketed root-finding (Brent's method)
+
+    Black-Scholes price is strictly increasing in sigma, so the root is always
+    bracketed by [IV_SEARCH_MIN, IV_SEARCH_MAX] whenever the quote is
+    attainable at all.  Brent is used in preference to Newton-Raphson because
+    vega collapses towards zero for short-dated out-of-the-money options: from
+    a fixed seed the Newton step overshoots into sigma <= 0, and the solve
+    fails on exactly the contracts (1-2 DTE, OTM) where an accurate IV matters
+    most.  A failed solve is silent at the call sites, which then fall back to
+    the data provider's own stored IV field.
 
     Parameters:
     option_price (float): Market price of the option
@@ -160,43 +176,42 @@ def implied_volatility(option_price, S, K, T, r, option_type='call', max_iterati
     T (float): Time to expiration in years
     r (float): Risk-free interest rate (as decimal)
     option_type (str): 'call' or 'put'
-    max_iterations (int): Maximum number of iterations
-    tolerance (float): Convergence tolerance
+    max_iterations (int): Maximum root-finder iterations
+    tolerance (float): Price-space tolerance for the zero-vol edge case
 
     Returns:
-    float: Implied volatility (as decimal) or None if not converged
+    float: Implied volatility (as decimal), or None when the price lies
+           outside the attainable range (stale or crossed quote) or the
+           inputs are degenerate
     """
-    if T <= 0:
+    if T <= 0 or option_price is None or option_price <= 0 or S <= 0 or K <= 0:
         return None
 
-    # Initial guess
-    sigma = 0.3
+    if option_type == 'call':
+        def price_at(sigma):
+            return black_scholes_call(S, K, T, r, sigma)
+    else:
+        def price_at(sigma):
+            return black_scholes_put(S, K, T, r, sigma)
 
-    for i in range(max_iterations):
-        if option_type == 'call':
-            price = black_scholes_call(S, K, T, r, sigma)
-        else:
-            price = black_scholes_put(S, K, T, r, sigma)
+    f_lo = price_at(IV_SEARCH_MIN) - option_price
+    f_hi = price_at(IV_SEARCH_MAX) - option_price
 
-        diff = price - option_price
+    # Quote sits below the zero-vol floor (under discounted intrinsic) or above
+    # the sigma ceiling — no root exists, so let the caller fall back.
+    if f_lo > 0 or f_hi < 0:
+        return None
+    if abs(f_lo) < tolerance:
+        return IV_SEARCH_MIN
 
-        if abs(diff) < tolerance:
-            return sigma
+    try:
+        sigma = brentq(lambda s: price_at(s) - option_price,
+                       IV_SEARCH_MIN, IV_SEARCH_MAX,
+                       xtol=1e-8, maxiter=max_iterations)
+    except (ValueError, RuntimeError):
+        return None
 
-        # Vega for Newton-Raphson
-        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-        vega = S * norm.pdf(d1) * np.sqrt(T)
-
-        if vega < 1e-10:
-            return None
-
-        sigma = sigma - diff / vega
-
-        # Keep sigma positive
-        if sigma <= 0:
-            sigma = 0.01
-
-    return None  # Did not converge
+    return sigma if sigma > 0 else None
 
 
 def american_option_binomial(S, K, T, r, sigma, q=0, option_type='call', steps=100):

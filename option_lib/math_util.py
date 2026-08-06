@@ -84,22 +84,6 @@ def next_option_friday() -> 'date':
     return today + timedelta(days=days)
 
 
-def get_days_to_expiration(expiration_date_str: str) -> int:
-    """Days from today to expiration_date_str ('YYYY-MM-DD'), minimum 0."""
-    try:
-        exp   = datetime.strptime(expiration_date_str, "%Y-%m-%d").date()
-        today = datetime.now().date()
-        return max((exp - today).days, 0)
-    except Exception as e:
-        print(f"Error calculating days to expiration: {e}")
-        return 0
-
-
-def get_years_to_expiration(expiration_date_str: str) -> float:
-    """Years from today to expiration (for Black-Scholes T)."""
-    return get_days_to_expiration(expiration_date_str) / 365.0
-
-
 # ── Market sessions ────────────────────────────────────────────────────────────
 
 MARKET_TZ = ZoneInfo("America/New_York")
@@ -107,6 +91,48 @@ MARKET_TZ = ZoneInfo("America/New_York")
 _PRE_OPEN     = _time(4, 0)
 _MARKET_OPEN  = _time(9, 30)
 _MARKET_CLOSE = _time(16, 0)
+
+_HOURS_PER_YEAR = 24.0 * 365.0
+
+
+def get_days_to_expiration(expiration_date_str: str) -> int:
+    """Whole calendar days from today to expiration ('YYYY-MM-DD'), minimum 0.
+
+    For display only.  Pricing must use get_years_to_expiration(), which counts
+    the hours actually remaining instead of rounding down to whole days.
+    """
+    try:
+        exp   = datetime.strptime(expiration_date_str, "%Y-%m-%d").date()
+        today = datetime.now(MARKET_TZ).date()
+        return max((exp - today).days, 0)
+    except Exception as e:
+        print(f"Error calculating days to expiration: {e}")
+        return 0
+
+
+def get_hours_to_expiration(expiration_date_str: str) -> float:
+    """Hours from now to the 16:00 ET close on expiration day, minimum 0."""
+    try:
+        exp    = datetime.strptime(expiration_date_str, "%Y-%m-%d").date()
+        expiry = datetime.combine(exp, _MARKET_CLOSE, tzinfo=MARKET_TZ)
+        return max((expiry - datetime.now(MARKET_TZ)).total_seconds() / 3600.0, 0.0)
+    except Exception as e:
+        print(f"Error calculating hours to expiration: {e}")
+        return 0.0
+
+
+def get_years_to_expiration(expiration_date_str: str) -> float:
+    """Years from now to expiration (for Black-Scholes T).
+
+    Counts the remaining *hours*, not whole calendar days.  Options trade until
+    16:00 ET on expiry day, so a Thursday-afternoon view of a Friday expiry has
+    ~29h left rather than 24h, and a Friday-morning view has ~6h left rather
+    than none.  Flooring to whole days understates T by 20%+ inside the last two
+    days and collapses expiry-day options to pure intrinsic value with all
+    greeks at zero — the error is invisible at 30 DTE and dominant at 1 DTE,
+    where price is roughly exponential in sigma*sqrt(T).
+    """
+    return get_hours_to_expiration(expiration_date_str) / _HOURS_PER_YEAR
 
 # Session name → the get_stock_info() field holding that session's price.
 EXTENDED_PRICE_KEY = {'pre': 'pre_market_price', 'post': 'post_market_price'}
@@ -146,13 +172,38 @@ def market_session(now=None) -> str:
     return "post"
 
 
+def in_weekend_carry(now=None) -> bool:
+    """True in the closed stretch between Friday's after-hours and Monday's pre-market.
+
+    Covers Saturday daytime, all of Sunday, and Monday before 04:00 ET.  (Saturday
+    00:00–04:00 is excluded because market_session() already reads it as 'post'.)
+    """
+    now = now or datetime.now(MARKET_TZ)
+    wd  = now.weekday()
+    if wd in (5, 6):                                  # Saturday / Sunday
+        return True
+    return wd == 0 and now.time() < _PRE_OPEN         # Monday small hours
+
+
 def extended_underlying(info: dict, now=None):
-    """S for extended-hours pricing: the current session's price, else the regular one.
+    """S for extended-hours pricing: the freshest print available, else the regular one.
 
     Only the field belonging to the session the clock is in is fresh — providers
     keep reporting a field long after its session ends (Yahoo carries the
     morning's preMarketPrice all evening), so picking whichever one is populated
     prices options off a quote that can be half a day old.
+
+    The weekend is the one exception.  market_session() reports 'closed' from
+    Saturday morning until Monday 04:00, but no print occurs in that window, so
+    Friday's last after-hours trade remains the freshest quote and stays the
+    right basis for pricing — the same reasoning that runs the post session past
+    midnight on weekdays.  Falling back to current_price there would price the
+    whole weekend off Friday's 16:00 close and discard every after-hours move,
+    which is exactly when headlines tend to land.  If the provider has cleared
+    the field by then, the current_price fallback still applies.
     """
+    now = now or datetime.now(MARKET_TZ)
     key = EXTENDED_PRICE_KEY.get(market_session(now))
+    if key is None and in_weekend_carry(now):
+        key = EXTENDED_PRICE_KEY['post']
     return (info.get(key) if key else None) or info.get("current_price")
