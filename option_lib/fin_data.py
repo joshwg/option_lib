@@ -52,6 +52,16 @@ class CompositeDataProvider(DataProvider):
                 continue
         return None
 
+    def get_sector(self, ticker: str) -> str | None:
+        """Sector from the pricing provider.
+
+        Not part of the earnings fallback chain: every provider resolves sector
+        through the same Yahoo-backed cache, so asking a second one after the
+        first returns None would only repeat the identical lookup.  None is a
+        real answer here (ETFs have no sector), not a miss to retry.
+        """
+        return self.pricing_provider.get_sector(ticker)
+
     def get_stock_data(self, ticker: str) -> dict | None:
         return self.pricing_provider.get_stock_data(ticker)
 
@@ -174,6 +184,10 @@ def get_stock_info(ticker: str) -> dict:
 
 def get_earnings_date(ticker: str) -> str | None:
     return get_provider().get_earnings_date(ticker)
+
+
+def get_sector(ticker: str) -> str | None:
+    return get_provider().get_sector(ticker)
 
 
 def get_stock_data(ticker: str) -> dict | None:

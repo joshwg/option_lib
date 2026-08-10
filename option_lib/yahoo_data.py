@@ -13,6 +13,7 @@ import numpy as np
 import requests
 import pytz
 from option_lib import pricing as _pricing
+from option_lib import sector_cache as _sector_cache
 
 # Import YFRateLimitError if available (yfinance ≥ 0.2.28)
 try:
@@ -38,6 +39,7 @@ _TTL_VOL      = int(os.environ.get('CACHE_TTL_VOL',     1800))
 _TTL_EXPIRIES = int(os.environ.get('CACHE_TTL_EXPIRIES', 1800))
 _TTL_SEARCH   = int(os.environ.get('CACHE_TTL_SEARCH',  3600))
 _TTL_EARNINGS = int(os.environ.get('CACHE_TTL_EARNINGS', 86400))  # 24 h — dates rarely change
+# Sectors are cached on disk for a month instead — see sector_cache.
 
 # ---------------------------------------------------------------------------
 # Rate limiting — minimum gap between Yahoo Finance network calls.
@@ -231,6 +233,46 @@ def get_earnings_date(ticker: str) -> str | None:
     return None
 
 
+def get_sector(ticker: str) -> str | None:
+    """Return the company's sector (e.g. 'Technology'), or None if it has none.
+
+    Yahoo's sector vocabulary is the coarse eleven-way split ('Technology',
+    'Energy', 'Financial Services', …) rather than a granular industry, which is
+    what a portfolio column wants.  ETFs, indices, and other non-operating
+    issues genuinely have no sector; that None is an answer, not a failure, and
+    is cached like any other.
+
+    Backed by sector_cache, which persists to disk with a one-month expiry — a
+    sector does not change, and .info is Yahoo's heaviest call, so it is not
+    worth re-fetching on every process start.  A *failed* lookup is not written
+    to disk; it retries on the next call rather than sticking for a month.
+    """
+    cached, hit = _sector_cache.get(ticker)
+    if hit:
+        return cached
+
+    # A full stock-info fetch already pulled .info; reuse it rather than repeat
+    # the call.  A successful fetch is authoritative even when sector is None.
+    info_cached, info_hit = _cache.get(('get_stock_info', ticker.upper()))
+    if info_hit and info_cached.get('success'):
+        result = info_cached.get('sector')
+        _sector_cache.put(ticker, result)
+        return result
+
+    _yf_rate_limit()
+    for _attempt in range(3):
+        try:
+            result = (yf.Ticker(ticker).info or {}).get('sector') or None
+            _sector_cache.put(ticker, result)
+            return result
+        except Exception as _exc:
+            if _YFRateLimitError and isinstance(_exc, _YFRateLimitError):
+                _on_rate_limited()
+                continue
+            return None
+    return None
+
+
 def get_stock_info(ticker):
     """
     Get current stock information
@@ -327,6 +369,8 @@ def get_stock_info(ticker):
             'market_cap': info.get('marketCap'),
             'dividend_yield': dividend_yield,
             'earnings_date': earnings_date,
+            # None for ETFs and other non-operating issues, which have no sector.
+            'sector': info.get('sector') or None,
             'pre_market_price':  pre_market_price,
             'post_market_price': post_market_price,
             'success': True

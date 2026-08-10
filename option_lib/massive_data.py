@@ -350,6 +350,21 @@ def get_earnings_date(ticker: str) -> str | None:
     return _yahoo.get_earnings_date(ticker)
 
 
+# ── Sector ────────────────────────────────────────────────────────────────────
+
+def get_sector(ticker: str) -> str | None:
+    """Company sector (e.g. 'Technology'), or None if it has none.
+
+    Delegates to Yahoo.  Massive's /v3/reference/tickers does carry a
+    classification, but only as a SIC description — 'ELECTRONIC COMPUTERS' for
+    AAPL, 'MINING & QUARRYING OF NONMETALLIC MINERALS (NO FUELS)' for UUUU —
+    which is too granular to group a portfolio by and absent entirely for ETFs.
+    Yahoo's coarse sector names are what a column wants, so there is nothing to
+    gain by spending a Massive call here.
+    """
+    return _yahoo.get_sector(ticker)
+
+
 # ── Historical volatility ──────────────────────────────────────────────────────
 
 def calculate_historical_volatility(

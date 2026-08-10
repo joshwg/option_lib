@@ -104,6 +104,14 @@ class FinnhubDataProvider:
             return self.fallback_provider.get_earnings_date(ticker)
         return None
 
+    def get_sector(self, ticker: str) -> str | None:
+        # Finnhub's profile endpoint carries an industry, but not on the free
+        # tier this provider targets — defer to the fallback like the pricing
+        # methods do.
+        if self.fallback_provider:
+            return self.fallback_provider.get_sector(ticker)
+        return None
+
     def get_days_to_expiration(self, expiration_date_str: str) -> int:
         if self.fallback_provider:
             return self.fallback_provider.get_days_to_expiration(expiration_date_str)

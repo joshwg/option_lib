@@ -55,6 +55,10 @@ class DataProvider(ABC):
         """Next upcoming earnings date as 'YYYY-MM-DD', or None."""
 
     @abstractmethod
+    def get_sector(self, ticker: str) -> str | None:
+        """Company sector (e.g. 'Technology'), or None for ETFs and the like."""
+
+    @abstractmethod
     def get_stock_data(self, ticker: str) -> dict | None:
         """Kivy-compatible stock dict, or None on failure."""
 
@@ -206,6 +210,9 @@ class YahooDataProvider(DataProvider):
     def get_earnings_date(self, ticker):
         return self._m.get_earnings_date(ticker)
 
+    def get_sector(self, ticker):
+        return self._m.get_sector(ticker)
+
     def get_stock_data(self, ticker):
         return self._m.get_stock_data(ticker)
 
@@ -295,6 +302,9 @@ class MassiveDataProvider(DataProvider):
 
     def get_earnings_date(self, ticker):
         return self._m.get_earnings_date(ticker)
+
+    def get_sector(self, ticker):
+        return self._m.get_sector(ticker)
 
     def get_stock_data(self, ticker):
         return self._m.get_stock_data(ticker)
