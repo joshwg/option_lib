@@ -134,7 +134,16 @@ def get_years_to_expiration(expiration_date_str: str) -> float:
     """
     return get_hours_to_expiration(expiration_date_str) / _HOURS_PER_YEAR
 
-# Session name → the get_stock_info() field holding that session's price.
+# Which price basis each clock session uses: pre-market hours show the
+# pre-market print, regular hours the regular one, and every other hour the
+# post-market print.  'closed' — the weekend, and Monday before 04:00 — maps to
+# 'post' because no trade happens in that window, so Friday's last after-hours
+# print is still the freshest quote there is.  Falling back to the regular close
+# would discard every after-hours move across the weekend, which is exactly when
+# news tends to land.  Mirrored by MarginWatch's market_data_service.
+SESSION_BASIS = {'pre': 'pre', 'regular': None, 'post': 'post', 'closed': 'post'}
+
+# Price basis → the get_stock_info() field holding it.
 EXTENDED_PRICE_KEY = {'pre': 'pre_market_price', 'post': 'post_market_price'}
 
 
@@ -172,38 +181,18 @@ def market_session(now=None) -> str:
     return "post"
 
 
-def in_weekend_carry(now=None) -> bool:
-    """True in the closed stretch between Friday's after-hours and Monday's pre-market.
-
-    Covers Saturday daytime, all of Sunday, and Monday before 04:00 ET.  (Saturday
-    00:00–04:00 is excluded because market_session() already reads it as 'post'.)
-    """
-    now = now or datetime.now(MARKET_TZ)
-    wd  = now.weekday()
-    if wd in (5, 6):                                  # Saturday / Sunday
-        return True
-    return wd == 0 and now.time() < _PRE_OPEN         # Monday small hours
-
-
 def extended_underlying(info: dict, now=None):
-    """S for extended-hours pricing: the freshest print available, else the regular one.
+    """S for extended-hours pricing: the print the clock calls for, else the regular one.
 
-    Only the field belonging to the session the clock is in is fresh — providers
-    keep reporting a field long after its session ends (Yahoo carries the
-    morning's preMarketPrice all evening), so picking whichever one is populated
-    prices options off a quote that can be half a day old.
+    Only the field belonging to the basis the clock calls for is fresh —
+    providers keep reporting a field long after its session ends (Yahoo carries
+    the morning's preMarketPrice all evening), so picking whichever one is
+    populated prices options off a quote that can be half a day old.
 
-    The weekend is the one exception.  market_session() reports 'closed' from
-    Saturday morning until Monday 04:00, but no print occurs in that window, so
-    Friday's last after-hours trade remains the freshest quote and stays the
-    right basis for pricing — the same reasoning that runs the post session past
-    midnight on weekdays.  Falling back to current_price there would price the
-    whole weekend off Friday's 16:00 close and discard every after-hours move,
-    which is exactly when headlines tend to land.  If the provider has cleared
-    the field by then, the current_price fallback still applies.
+    An empty field means nothing traded in that window — a stock with no
+    pre-market interest, or a weekend after a quiet Friday close — and the
+    regular price stands in.
     """
-    now = now or datetime.now(MARKET_TZ)
-    key = EXTENDED_PRICE_KEY.get(market_session(now))
-    if key is None and in_weekend_carry(now):
-        key = EXTENDED_PRICE_KEY['post']
+    basis = SESSION_BASIS.get(market_session(now))
+    key = EXTENDED_PRICE_KEY.get(basis)
     return (info.get(key) if key else None) or info.get("current_price")
