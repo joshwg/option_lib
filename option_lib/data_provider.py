@@ -48,6 +48,11 @@ class DataProvider(ABC):
             ticker, current_price, company_name, previous_close,
             volume, avg_volume, market_cap, dividend_yield,
             earnings_date, success
+
+        The Yahoo path also carries 'sector', because its .info call already
+        has it and get_sector() reuses that to avoid a second fetch.  Massive's
+        does not — it has no sector to give.  Do not read info['sector']; call
+        get_sector(), which is provider-independent and cached across restarts.
         """
 
     @abstractmethod
