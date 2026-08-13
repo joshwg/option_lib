@@ -24,12 +24,13 @@ import numpy as np
 import pytz
 import requests
 
+from option_lib import implied_vol as _implied_vol
+from option_lib import name_cache as _name_cache
 from option_lib import pricing as _pricing
 from option_lib import yahoo_data as _yahoo      # fallback
 from option_lib.math_util import (
     safe_float as _safe_float,
     TTLCache as _TTLCache,
-    iv_from_mid as _iv_from_mid,
     get_days_to_expiration,
     get_years_to_expiration,
     market_session as _market_session,
@@ -365,6 +366,39 @@ def get_sector(ticker: str) -> str | None:
     return _yahoo.get_sector(ticker)
 
 
+# ── Company name ───────────────────────────────────────────────────────────────
+
+def get_company_name(ticker: str) -> str | None:
+    """Company display name (e.g. 'Apple Inc.'), or None if unknown.
+
+    Unlike sector, this one Massive can answer well and cheaply: the same
+    /v3/reference/tickers record get_stock_info() already reads carries a proper
+    company name, so a single reference call settles it without touching Yahoo.
+    Falls back to Yahoo when the key is unset, the plan is not entitled to
+    reference data, or the call fails.
+
+    Cached on disk via name_cache, so the fallback path is taken at most once a
+    month per symbol.
+    """
+    cached, state = _name_cache.peek(ticker)
+    if state == _name_cache.FRESH:
+        return cached
+    if state == _name_cache.STALE and not _name_cache.claim(ticker):
+        return cached       # another app is refreshing it — the cache is shared
+
+    if _is_key_set() and not _entitlement_blocked("ticker reference"):
+        try:
+            ref  = _get(f"/v3/reference/tickers/{ticker.upper()}")
+            name = ((ref.get("results") or {}).get("name") or "").strip() or None
+            if name:
+                _name_cache.put(ticker, name)
+                return name
+        except Exception as e:
+            _note_entitlement_failure("ticker reference", e)
+
+    return _yahoo.get_company_name(ticker)
+
+
 # ── Historical volatility ──────────────────────────────────────────────────────
 
 def calculate_historical_volatility(
@@ -629,17 +663,12 @@ def get_implied_volatility_for_strike(
         if not options.get("success"):
             return None
         chain = options["calls"] if option_type == "call" else options["puts"]
-        best  = min(chain, key=lambda o: abs(o["strike"] - strike), default=None)
-        if best is None:
-            return None
         if S is None:
             info = get_stock_info(ticker)
             S    = info.get("current_price") if info.get("success") else None
-        T  = get_years_to_expiration(expiration_date)
-        iv = _iv_from_mid(best["bid"], best["ask"], S, best["strike"], T, r, option_type)
-        if iv:
-            return iv
-        return best["implied_volatility"] if best["implied_volatility"] > 0 else None
+        T = get_years_to_expiration(expiration_date)
+        return _implied_vol.resolve_iv(chain, strike, option_type, S, T, r,
+                                       symbol=ticker, expiration=expiration_date)
     except Exception:
         return _yahoo.get_implied_volatility_for_strike(
             ticker, expiration_date, strike, option_type=option_type, S=S, r=r
@@ -662,11 +691,8 @@ def get_atm_implied_volatility(
         T = get_years_to_expiration(expiration_date)
 
         def _best_iv(chain, side):
-            best = min(chain, key=lambda o: abs(o["strike"] - current_price), default=None)
-            if best is None:
-                return None
-            iv = _iv_from_mid(best["bid"], best["ask"], current_price, best["strike"], T, r, side)
-            return iv or (best["implied_volatility"] if best["implied_volatility"] > 0 else None)
+            return _implied_vol.resolve_iv(chain, current_price, side, current_price, T, r,
+                                           symbol=ticker, expiration=expiration_date)
 
         call_iv = _best_iv(options["calls"], "call")
         put_iv  = _best_iv(options["puts"],  "put")

@@ -62,6 +62,15 @@ class CompositeDataProvider(DataProvider):
         """
         return self.pricing_provider.get_sector(ticker)
 
+    def get_company_name(self, ticker: str) -> str | None:
+        """Company display name from the pricing provider.
+
+        Outside the earnings fallback chain for the same reason as get_sector:
+        every provider resolves names through the same disk cache, so a second
+        opinion would only repeat the lookup.
+        """
+        return self.pricing_provider.get_company_name(ticker)
+
     def get_stock_data(self, ticker: str) -> dict | None:
         return self.pricing_provider.get_stock_data(ticker)
 
@@ -188,6 +197,10 @@ def get_earnings_date(ticker: str) -> str | None:
 
 def get_sector(ticker: str) -> str | None:
     return get_provider().get_sector(ticker)
+
+
+def get_company_name(ticker: str) -> str | None:
+    return get_provider().get_company_name(ticker)
 
 
 def get_stock_data(ticker: str) -> dict | None:

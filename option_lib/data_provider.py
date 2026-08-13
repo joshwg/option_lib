@@ -64,6 +64,15 @@ class DataProvider(ABC):
         """Company sector (e.g. 'Technology'), or None for ETFs and the like."""
 
     @abstractmethod
+    def get_company_name(self, ticker: str) -> str | None:
+        """Company display name (e.g. 'Apple Inc.'), or None if unknown.
+
+        Like get_sector(), this is cached on disk across restarts, so it is
+        cheap enough to call per row of a table.  Callers should fall back to
+        showing the ticker itself when it returns None.
+        """
+
+    @abstractmethod
     def get_stock_data(self, ticker: str) -> dict | None:
         """Kivy-compatible stock dict, or None on failure."""
 
@@ -218,6 +227,9 @@ class YahooDataProvider(DataProvider):
     def get_sector(self, ticker):
         return self._m.get_sector(ticker)
 
+    def get_company_name(self, ticker):
+        return self._m.get_company_name(ticker)
+
     def get_stock_data(self, ticker):
         return self._m.get_stock_data(ticker)
 
@@ -310,6 +322,9 @@ class MassiveDataProvider(DataProvider):
 
     def get_sector(self, ticker):
         return self._m.get_sector(ticker)
+
+    def get_company_name(self, ticker):
+        return self._m.get_company_name(ticker)
 
     def get_stock_data(self, ticker):
         return self._m.get_stock_data(ticker)

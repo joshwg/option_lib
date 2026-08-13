@@ -13,6 +13,7 @@ import numpy as np
 import requests
 import pytz
 from option_lib import pricing as _pricing
+from option_lib import name_cache as _name_cache
 from option_lib import sector_cache as _sector_cache
 
 # Import YFRateLimitError if available (yfinance ≥ 0.2.28)
@@ -22,6 +23,8 @@ except ImportError:
     _YFRateLimitError = None
 
 
+from option_lib import implied_vol as _implied_vol
+from option_lib import iv_cache as _iv_cache
 from option_lib.math_util import (
     safe_float as _safe_float,
     TTLCache as _TTLCache,
@@ -39,7 +42,8 @@ _TTL_VOL      = int(os.environ.get('CACHE_TTL_VOL',     1800))
 _TTL_EXPIRIES = int(os.environ.get('CACHE_TTL_EXPIRIES', 1800))
 _TTL_SEARCH   = int(os.environ.get('CACHE_TTL_SEARCH',  3600))
 _TTL_EARNINGS = int(os.environ.get('CACHE_TTL_EARNINGS', 86400))  # 24 h — dates rarely change
-# Sectors are cached on disk for a month instead — see sector_cache.
+# Sectors and company names are cached on disk for a month instead — see
+# sector_cache and name_cache.
 
 # ---------------------------------------------------------------------------
 # Rate limiting — minimum gap between Yahoo Finance network calls.
@@ -247,8 +251,13 @@ def get_sector(ticker: str) -> str | None:
     worth re-fetching on every process start.  A *failed* lookup is not written
     to disk; it retries on the next call rather than sticking for a month.
     """
-    cached, hit = _sector_cache.get(ticker)
-    if hit:
+    cached, state = _sector_cache.peek(ticker)
+    if state == _sector_cache.FRESH:
+        return cached
+    if state == _sector_cache.STALE and not _sector_cache.claim(ticker):
+        # The month is up, but another app is already re-fetching this symbol —
+        # the cache directory is shared, so its answer will be ours too.  Serve
+        # the old sector rather than spend a second identical lookup on it.
         return cached
 
     # A full stock-info fetch already pulled .info; reuse it rather than repeat
@@ -264,6 +273,49 @@ def get_sector(ticker: str) -> str | None:
         try:
             result = (yf.Ticker(ticker).info or {}).get('sector') or None
             _sector_cache.put(ticker, result)
+            return result
+        except Exception as _exc:
+            if _YFRateLimitError and isinstance(_exc, _YFRateLimitError):
+                _on_rate_limited()
+                continue
+            return None
+    return None
+
+
+def get_company_name(ticker: str) -> str | None:
+    """Return the company's display name (e.g. 'Apple Inc.'), or None.
+
+    Backed by name_cache on the same terms as get_sector: a name is display-only
+    reference data, so a month-old answer is fine and a fresh .info call per
+    symbol per process start is not.  A *failed* lookup is not written to disk;
+    it retries on the next call rather than sticking for a month.
+
+    Prefers longName ('Apple Inc.') over shortName ('Apple'), which is what a
+    tooltip on a ticker wants.  None means Yahoo had no name for the symbol —
+    callers should fall back to showing the ticker itself.
+    """
+    cached, state = _name_cache.peek(ticker)
+    if state == _name_cache.FRESH:
+        return cached
+    if state == _name_cache.STALE and not _name_cache.claim(ticker):
+        return cached       # another app is refreshing it — see get_sector()
+
+    # A full stock-info fetch already pulled .info; reuse it rather than repeat
+    # the call.  get_stock_info() stores longName under 'company_name', defaulted
+    # to the ticker — which is not a name, so it is not worth caching as one.
+    info_cached, info_hit = _cache.get(('get_stock_info', ticker.upper()))
+    if info_hit and info_cached.get('success'):
+        result = info_cached.get('company_name') or None
+        if result and result.upper() != ticker.upper():
+            _name_cache.put(ticker, result)
+            return result
+
+    _yf_rate_limit()
+    for _attempt in range(3):
+        try:
+            info   = yf.Ticker(ticker).info or {}
+            result = info.get('longName') or info.get('shortName') or None
+            _name_cache.put(ticker, result)
             return result
         except Exception as _exc:
             if _YFRateLimitError and isinstance(_exc, _YFRateLimitError):
@@ -588,8 +640,11 @@ def get_options_for_expiration(ticker, expiration_date):
 def get_implied_volatility_for_strike(ticker, expiration_date, strike, option_type='call', S=None, r=0.045):
     """
     Get implied volatility for a specific strike and expiration.
-    Computes IV from the bid/ask mid price; falls back to Yahoo's pre-computed
-    field only if the mid-based Newton-Raphson does not converge.
+
+    Resolution runs through implied_vol.resolve_iv — the bid/ask mid first, then
+    a ladder of fallbacks for the times there is no mid to be had, which is every
+    contract outside regular hours and the illiquid strikes at any hour.  See
+    that module for the rungs and why they are ordered the way they are.
 
     Parameters:
     ticker (str): Stock ticker symbol
@@ -609,42 +664,14 @@ def get_implied_volatility_for_strike(ticker, expiration_date, strike, option_ty
 
         chain = options['calls'] if option_type == 'call' else options['puts']
 
-        best_match = None
-        min_diff = float('inf')
-        for opt in chain:
-            diff = abs(opt['strike'] - strike)
-            if diff < min_diff:
-                min_diff = diff
-                best_match = opt
-
-        if best_match is None:
-            return None
-
         # Resolve current stock price if not supplied
         if S is None:
             info = get_stock_info(ticker)
             S = info.get('current_price') if info.get('success') else None
 
         T = get_years_to_expiration(expiration_date)
-        K = best_match['strike']
-
-        # Primary: IV from bid/ask mid (most accurate when market is open)
-        iv = _iv_from_mid(best_match['bid'], best_match['ask'], S, K, T, r, option_type)
-        if iv:
-            return iv
-
-        # Pre-market fallback: bid/ask are often 0 before open; use last traded price
-        last = _safe_float(best_match.get('last_price'), None)
-        if last and last > 0 and S and T > 0:
-            try:
-                iv = _pricing.implied_volatility(last, S, K, T, r, option_type=option_type)
-                if iv:
-                    return iv
-            except Exception:
-                pass
-
-        # Final fallback: Yahoo's pre-computed field (stale but better than None)
-        return best_match['implied_volatility'] if best_match['implied_volatility'] > 0 else None
+        return _implied_vol.resolve_iv(chain, strike, option_type, S, T, r,
+                                       symbol=ticker, expiration=expiration_date)
     except Exception as e:
         print(f"Error getting implied volatility: {e}")
         return None
@@ -674,19 +701,8 @@ def get_atm_implied_volatility(ticker, expiration_date, current_price, option_ty
         T = get_years_to_expiration(expiration_date)
 
         def _best_iv(chain, side):
-            best_opt = None
-            min_diff = float('inf')
-            for opt in chain:
-                diff = abs(opt['strike'] - current_price)
-                if diff < min_diff:
-                    min_diff = diff
-                    best_opt = opt
-            if best_opt is None:
-                return None
-            iv = _iv_from_mid(best_opt['bid'], best_opt['ask'], current_price, best_opt['strike'], T, r, side)
-            if iv:
-                return iv
-            return best_opt['implied_volatility'] if best_opt['implied_volatility'] > 0 else None
+            return _implied_vol.resolve_iv(chain, current_price, side, current_price, T, r,
+                                           symbol=ticker, expiration=expiration_date)
 
         call_iv = _best_iv(options['calls'], 'call')
         put_iv  = _best_iv(options['puts'],  'put')
@@ -887,7 +903,12 @@ def _get_contract_iv(symbol: str, expiration_iso: str, strike: float,
 
     if bid and ask and bid > 0 and ask > 0:
         iv = _iv_from_mid(bid, ask, S, strike, T, r, side)
-        if iv:
+        if _implied_vol.plausible_iv(iv):
+            # Same live-market rung as resolve_iv's first, reached by a targeted
+            # quote instead of the chain — so remember it on the same terms, or
+            # a contract priced only down this path would have nothing on disk
+            # to fall back to once the quotes go away.
+            _iv_cache.put(_iv_cache.contract_key(symbol, expiration_iso, strike, side), iv)
             return iv
 
     # Fallback: full chain (already cached per (ticker, expiration) pair).

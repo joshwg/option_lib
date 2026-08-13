@@ -112,6 +112,13 @@ class FinnhubDataProvider:
             return self.fallback_provider.get_sector(ticker)
         return None
 
+    def get_company_name(self, ticker: str) -> str | None:
+        # Same story as sector: the company profile that carries the name is not
+        # on the free tier, so defer to the fallback.
+        if self.fallback_provider:
+            return self.fallback_provider.get_company_name(ticker)
+        return None
+
     def get_days_to_expiration(self, expiration_date_str: str) -> int:
         if self.fallback_provider:
             return self.fallback_provider.get_days_to_expiration(expiration_date_str)
