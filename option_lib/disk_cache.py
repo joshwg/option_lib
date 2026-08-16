@@ -55,6 +55,10 @@ _app_tag = ""
 # killed mid-refresh doesn't strand the symbol for long.
 CLAIM_LEASE_SECONDS = int(os.environ.get("OPTION_LIB_CLAIM_LEASE", 300))
 
+# How long an unchanged-looking file is trusted before being read again.  Bounds
+# how stale one app's view of another's writes can get; see DiskCache._load().
+REVALIDATE_SECONDS = float(os.environ.get("OPTION_LIB_REVALIDATE", 1.0))
+
 # Freshness states reported by DiskCache.peek().
 FRESH   = "fresh"      # inside the TTL — use it
 STALE   = "stale"      # past the TTL, but the old value is still good enough to show
@@ -126,9 +130,10 @@ class DiskCache:
         self._field       = field
         self._ttl         = ttl_seconds
         self._lock        = self._lock_for(filename)
-        self._entries: dict[str, tuple[object, float]] | None = None
+        self._entries: dict[str, _Entry] | None = None
         self._disk_ok     = True    # cleared after a write failure, so we stop retrying it
-        self._mtime       = -1.0    # mtime of the file our in-memory copy came from
+        self._signature_seen: tuple = ()   # stat fingerprint our copy came from
+        self._checked_at  = 0.0     # monotonic time that fingerprint was verified
 
     # ── Location ──────────────────────────────────────────────────────────────
 
@@ -165,25 +170,44 @@ class DiskCache:
             pass    # missing or corrupt — start empty
         return entries
 
-    def _file_mtime(self) -> float:
-        try:
-            return self._path().stat().st_mtime
-        except OSError:
-            return -1.0
+    def _signature(self) -> tuple:
+        """Cheap fingerprint of the file, for spotting another process's write.
 
-    def _load(self) -> dict[str, tuple[object, float]]:
-        """Return the in-memory map, re-reading the file if it changed.
+        Inode included because every write lands via os.replace(), so a new
+        write is a new inode — a stronger signal than the timestamp, which some
+        filesystems advance too coarsely to distinguish writes a millisecond
+        apart (WSL's /tmp reports the identical mtime for three writes in a row).
+        Size and mtime come along to cover the case where a freed inode is
+        immediately reused.
+        """
+        try:
+            st = self._path().stat()
+            return (st.st_ino, st.st_size, st.st_mtime_ns)
+        except OSError:
+            return ()
+
+    def _load(self) -> dict[str, _Entry]:
+        """Return the in-memory map, re-reading the file if it may have changed.
 
         The re-read is what makes a shared cache directory pay off: several
         apps point OPTION_LIB_CACHE_DIR at one place, and a long-running server
         should pick up symbols another process fetched without being restarted.
-        The cost is one stat() per lookup, against a network call saved.
+
+        A changed signature forces the re-read immediately.  An unchanged one is
+        only trusted for REVALIDATE_SECONDS, because no stat field is guaranteed
+        to differ between two writes on every filesystem — that bounds how long
+        another app's work can stay invisible, at one file parse per second in
+        the worst case rather than one per lookup.
         """
-        mtime = self._file_mtime()
-        if self._entries is not None and mtime == self._mtime:
+        signature = self._signature()
+        now       = time.monotonic()
+        if (self._entries is not None
+                and signature == self._signature_seen
+                and now - self._checked_at < REVALIDATE_SECONDS):
             return self._entries
-        self._entries = self._read_file()
-        self._mtime   = mtime
+        self._entries        = self._read_file()
+        self._signature_seen = signature
+        self._checked_at     = now
         return self._entries
 
     @contextlib.contextmanager
@@ -249,8 +273,9 @@ class DiskCache:
                 payload[symbol] = rec
             tmp.write_text(json.dumps(payload, indent=0, sort_keys=True), encoding="utf-8")
             os.replace(tmp, path)   # atomic, so a crash mid-write cannot truncate the cache
-            self._entries = entries
-            self._mtime   = self._file_mtime()
+            self._entries        = entries
+            self._signature_seen = self._signature()
+            self._checked_at     = time.monotonic()
         except OSError:
             self._disk_ok = False   # read-only home, full disk — carry on in memory
             with contextlib.suppress(OSError):
@@ -359,5 +384,6 @@ class DiskCache:
                     self._write_locked({})
             # In memory regardless: a parked disk must not leave the cache with
             # no way to reset it at all.
-            self._entries = {}
-            self._mtime   = self._file_mtime()
+            self._entries        = {}
+            self._signature_seen = self._signature()
+            self._checked_at     = time.monotonic()

@@ -1,167 +1,219 @@
 """
-Disk-backed cache  (option_lib/tests/test_disk_cache.py)
+Shared disk cache  (option_lib/tests/test_disk_cache.py)
 ========================================================
-The cache file is shared: several apps point OPTION_LIB_CACHE_DIR at one
-directory, so a write merges rather than overwrites and nobody's entries are
-lost to whoever happened to load the file first.
+Covers what makes sectors.json and names.json safe to share between the apps
+that install option_lib.  They all point OPTION_LIB_CACHE_DIR at one directory
+on the server, so the file has several writers, and two things have to hold:
 
-clear() is the one operation that has to do the opposite.  Routed through the
-merging write it silently did nothing — it wrote an empty map, read the file
-back, folded it in, and left the cache exactly as it was.  Both behaviours are
-pinned here, against each other, because the fix for either one is the bug in
-the other.
+  * nobody's entries are lost.  A flush that rewrote the file from its own
+    snapshot dropped whatever another process had added since — which is how
+    six writers of 900 symbols ended up with 156 of them.
+  * a monthly expiry costs one re-fetch, not one per app.  Whoever notices the
+    staleness claims the symbol; everyone else serves the old value until the
+    new one lands.
+
+The cross-process tests really do fork: an in-process double of the file lock
+would prove nothing about the thing being defended against.
 
 Usage:
     python3 -m unittest option_lib/tests/test_disk_cache.py
 """
 
+import json
+import multiprocessing
 import os
 import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PROJ_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
 if _PROJ_ROOT not in sys.path:
     sys.path.insert(0, _PROJ_ROOT)
 
-from option_lib.disk_cache import DiskCache, FRESH, MISSING, STALE
+from option_lib import disk_cache
+from option_lib.disk_cache import FRESH, MISSING, STALE, DiskCache
 
 
-class _CacheTestCase(unittest.TestCase):
-    """Points the cache at a scratch directory for the life of one test."""
+def _write_batch(cache_dir: str, tag: str, worker: int, count: int) -> None:
+    """Child-process body: write *count* symbols of its own into the shared file."""
+    os.environ["OPTION_LIB_CACHE_DIR"] = cache_dir
+    disk_cache.set_app_tag(tag)
+    cache = DiskCache("sectors.json", field="sector", ttl_seconds=3600)
+    for i in range(count):
+        cache.put(f"W{worker}S{i}", f"Sector{worker}")
 
-    FILENAME = "test_cache.json"
-    FIELD    = "value"
-    TTL      = 3600
+
+class DiskCacheTestCase(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self._prev = os.environ.get("OPTION_LIB_CACHE_DIR")
         os.environ["OPTION_LIB_CACHE_DIR"] = self._tmp.name
+        self.dir = Path(self._tmp.name)
+        disk_cache.set_app_tag("test")
 
     def tearDown(self):
-        if self._prev is None:
-            os.environ.pop("OPTION_LIB_CACHE_DIR", None)
-        else:
-            os.environ["OPTION_LIB_CACHE_DIR"] = self._prev
+        os.environ.pop("OPTION_LIB_CACHE_DIR", None)
         self._tmp.cleanup()
 
-    def cache(self, ttl=None):
-        """A cache over the scratch file.
+    def cache(self, ttl=3600, filename="sectors.json"):
+        return DiskCache(filename, field="sector", ttl_seconds=ttl)
 
-        Each call returns a fresh instance with its own in-memory map, which is
-        how a second process sees the same file — the two share only the disk.
-        """
-        return DiskCache(self.FILENAME, field=self.FIELD,
-                         ttl_seconds=self.TTL if ttl is None else ttl)
+    # ── Basic read/write ──────────────────────────────────────────────────────
 
-    def path(self):
-        return os.path.join(self._tmp.name, self.FILENAME)
+    def test_roundtrip_and_miss(self):
+        cache = self.cache()
+        cache.put("AAPL", "Technology")
+        self.assertEqual(cache.get("AAPL"), ("Technology", True))
+        self.assertEqual(cache.get("NOSUCH"), (None, False))
 
+    def test_symbols_are_case_insensitive(self):
+        cache = self.cache()
+        cache.put("aapl", "Technology")
+        self.assertEqual(cache.get("AAPL"), ("Technology", True))
 
-class TestClear(_CacheTestCase):
+    def test_cached_none_is_a_hit(self):
+        """An ETF has no sector; None is the answer, not a reason to re-ask."""
+        cache = self.cache()
+        cache.put("SPY", None)
+        self.assertEqual(cache.get("SPY"), (None, True))
+        self.assertEqual(cache.peek("SPY"), (None, FRESH))
 
-    def test_clear_drops_the_value_it_just_stored(self):
-        c = self.cache()
-        c.put("AAPL", "Technology")
-        self.assertEqual(c.get("AAPL"), ("Technology", True))
-
-        c.clear()
-        self.assertEqual(c.get("AAPL"), (None, False))
-
-    def test_clear_reaches_the_file_not_just_memory(self):
-        """The regression: clearing left the file untouched.
-
-        Checked through a second instance, because the one that cleared could
-        report a miss from its own empty map while the disk still held
-        everything — which is exactly what it used to do.
-        """
+    def test_survives_a_new_instance(self):
         self.cache().put("AAPL", "Technology")
-        self.cache().clear()
+        self.assertEqual(self.cache().get("AAPL"), ("Technology", True))
 
-        self.assertEqual(self.cache().get("AAPL"), (None, False))
-        self.assertEqual(self.cache().peek("AAPL"), (None, MISSING))
+    # ── Freshness ─────────────────────────────────────────────────────────────
 
-    def test_clear_drops_entries_this_instance_never_loaded(self):
-        # Written by "another process" and never read by the one that clears.
-        self.cache().put("AAPL", "Technology")
-        self.cache().put("XOM", "Energy")
+    def test_peek_reports_missing_fresh_and_stale(self):
+        cache = self.cache(ttl=0.2)
+        self.assertEqual(cache.peek("AAPL"), (None, MISSING))
+        cache.put("AAPL", "Technology")
+        self.assertEqual(cache.peek("AAPL"), ("Technology", FRESH))
+        time.sleep(0.3)
+        # Stale still hands back the value — a month-old sector beats a blank cell.
+        self.assertEqual(cache.peek("AAPL"), ("Technology", STALE))
+        self.assertEqual(cache.get("AAPL"), (None, False))
 
-        c = self.cache()          # fresh, empty in-memory map
-        c.clear()
+    # ── Shared refresh ────────────────────────────────────────────────────────
 
-        self.assertEqual(self.cache().get("AAPL"), (None, False))
-        self.assertEqual(self.cache().get("XOM"), (None, False))
+    def test_only_one_app_claims_a_stale_symbol(self):
+        apps = [self.cache(ttl=0.2) for _ in range(3)]
+        apps[0].put("AAPL", "Technology")
+        time.sleep(0.3)
+        claims = [app.claim("AAPL") for app in apps]
+        self.assertEqual(claims.count(True), 1, claims)
 
-    def test_clear_leaves_a_readable_empty_file(self):
-        """Not deleted and not truncated to nothing — still valid JSON."""
-        import json
-        self.cache().put("AAPL", "Technology")
-        self.cache().clear()
+    def test_completed_refresh_releases_the_claim(self):
+        winner, other = self.cache(ttl=0.2), self.cache(ttl=0.2)
+        winner.put("AAPL", "Technology")
+        time.sleep(0.3)
+        self.assertTrue(winner.claim("AAPL"))
+        winner.put("AAPL", "Technology")          # refresh lands
+        record = json.loads((self.dir / "sectors.json").read_text())["AAPL"]
+        self.assertNotIn("claimed", record)
+        self.assertEqual(other.peek("AAPL"), ("Technology", FRESH))
 
-        self.assertTrue(os.path.exists(self.path()))
-        with open(self.path(), encoding="utf-8") as fh:
-            self.assertEqual(json.load(fh), {})
+    def test_claim_expires_with_its_lease(self):
+        """A process killed mid-refresh must not strand the symbol forever."""
+        cache = self.cache(ttl=0.2)
+        cache.put("AAPL", "Technology")
+        time.sleep(0.3)
+        self.assertTrue(cache.claim("AAPL", lease_seconds=0.2))
+        self.assertFalse(cache.claim("AAPL", lease_seconds=0.2))
+        time.sleep(0.3)
+        self.assertTrue(cache.claim("AAPL", lease_seconds=0.2))
 
-    def test_the_cache_still_works_after_a_clear(self):
-        c = self.cache()
-        c.put("AAPL", "Technology")
-        c.clear()
-        c.put("MSFT", "Technology")
+    def test_unfetched_symbol_is_not_claim_gated(self):
+        """With nothing to serve, every caller may as well fetch."""
+        a, b = self.cache(), self.cache()
+        self.assertTrue(a.claim("AAPL"))
+        self.assertTrue(b.claim("AAPL"))
 
-        self.assertEqual(self.cache().get("MSFT"), ("Technology", True))
-        self.assertEqual(self.cache().get("AAPL"), (None, False))
+    # ── Sharing the file ──────────────────────────────────────────────────────
 
-    def test_clear_on_an_untouched_cache_is_harmless(self):
-        self.cache().clear()
-        self.assertEqual(self.cache().get("AAPL"), (None, False))
-
-
-class TestMergeStillHolds(_CacheTestCase):
-    """clear() had to stop merging; put() still must, or this trades one bug for another."""
-
-    def test_a_write_keeps_another_process_entries(self):
-        first  = self.cache()
-        second = self.cache()
-        first.put("AAPL", "Technology")     # after second loaded its (empty) map
-        second.put("XOM", "Energy")
-
-        reader = self.cache()
+    def test_picks_up_another_writer_without_restarting(self):
+        reader, writer = self.cache(), self.cache()
+        reader.put("AAPL", "Technology")          # reader now holds a loaded copy
+        writer.put("MSFT", "Technology")
+        self.assertEqual(reader.get("MSFT"), ("Technology", True))
         self.assertEqual(reader.get("AAPL"), ("Technology", True))
-        self.assertEqual(reader.get("XOM"), ("Energy", True))
 
-    def test_the_newer_write_of_a_symbol_wins(self):
-        self.cache().put("AAPL", "Technology")
-        time.sleep(0.01)
-        self.cache().put("AAPL", "Consumer Electronics")
-        self.assertEqual(self.cache().get("AAPL"), ("Consumer Electronics", True))
+    def test_concurrent_processes_keep_every_entry(self):
+        workers, per_worker = 4, 50
+        procs = [
+            multiprocessing.Process(
+                target=_write_batch,
+                args=(str(self.dir), f"app{n}", n, per_worker),
+            )
+            for n in range(workers)
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=60)
 
+        written = json.loads((self.dir / "sectors.json").read_text())
+        self.assertEqual(len(written), workers * per_worker)
 
-class TestValueTypes(_CacheTestCase):
-    """Sectors and names are strings; a remembered IV is a float."""
+    def test_leaves_no_scratch_litter(self):
+        cache = self.cache()
+        for i in range(5):
+            cache.put(f"SYM{i}", "Technology")
+        leftovers = sorted(p.name for p in self.dir.iterdir())
+        self.assertEqual(leftovers, ["sectors.json", "sectors.json.lock"])
 
-    def test_a_float_round_trips(self):
-        self.cache().put("KEY", 0.4237)
-        self.assertEqual(self.cache().get("KEY"), (0.4237, True))
+    def test_scratch_file_is_named_for_the_app(self):
+        disk_cache.set_app_tag("margin")
+        self.assertEqual(disk_cache.app_tag(), "margin")
+        disk_cache.set_app_tag("Better Bettor/../")     # path characters stripped
+        self.assertEqual(disk_cache.app_tag(), "betterbettor")
 
-    def test_a_cached_none_is_a_hit(self):
-        # An ETF has no sector, and that is an answer worth remembering rather
-        # than re-fetching every time.
-        self.cache().put("SPY", None)
-        self.assertEqual(self.cache().get("SPY"), (None, True))
-        self.assertEqual(self.cache().peek("SPY"), (None, FRESH))
+    def test_app_tag_falls_back_to_the_environment(self):
+        disk_cache.set_app_tag("")
+        os.environ["OPTION_LIB_APP"] = "mlscan"
+        try:
+            self.assertEqual(disk_cache.app_tag(), "mlscan")
+        finally:
+            os.environ.pop("OPTION_LIB_APP", None)
 
+    # ── Degradation ───────────────────────────────────────────────────────────
 
-class TestExpiry(_CacheTestCase):
+    def test_corrupt_file_reads_as_empty_and_recovers(self):
+        (self.dir / "sectors.json").write_text("{not json at all")
+        cache = self.cache()
+        self.assertEqual(cache.get("AAPL"), (None, False))
+        cache.put("AAPL", "Technology")
+        self.assertEqual(self.cache().get("AAPL"), ("Technology", True))
 
-    def test_a_stale_entry_misses_but_still_offers_its_value(self):
-        self.cache(ttl=0).put("AAPL", "Technology")
-        c = self.cache(ttl=0)
-        self.assertEqual(c.get("AAPL"), (None, False))
-        self.assertEqual(c.peek("AAPL"), ("Technology", STALE))
+    def test_malformed_rows_do_not_cost_the_good_ones(self):
+        (self.dir / "sectors.json").write_text(json.dumps({
+            "AAPL": {"sector": "Technology", "fetched": time.time()},
+            "BAD1": {"sector": {"nested": "dict"}, "fetched": time.time()},
+            "BAD2": {"sector": "Technology"},              # no timestamp
+            "BAD3": "not even a record",
+        }))
+        cache = self.cache()
+        self.assertEqual(cache.get("AAPL"), ("Technology", True))
+        for bad in ("BAD1", "BAD2", "BAD3"):
+            self.assertEqual(cache.get(bad), (None, False), bad)
+
+    def test_stale_tmp_file_from_a_crash_is_overwritten(self):
+        (self.dir / "sectors.json.tmp.test").write_text("half a write")
+        cache = self.cache()
+        cache.put("AAPL", "Technology")
+        self.assertEqual(self.cache().get("AAPL"), ("Technology", True))
+        self.assertFalse((self.dir / "sectors.json.tmp.test").exists())
+
+    def test_clear_empties_the_file(self):
+        cache = self.cache()
+        cache.put("AAPL", "Technology")
+        cache.clear()
+        self.assertEqual(cache.get("AAPL"), (None, False))
+        self.assertEqual(json.loads((self.dir / "sectors.json").read_text()), {})
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main()

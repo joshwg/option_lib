@@ -4,7 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "option_lib"
-version = "1.0.0"
+# Bump this whenever the public API changes — a new function, or a changed
+# signature on an existing one.  The sibling apps install option_lib by path
+# (`pip install ../../option_lib`), and pip skips a path install whose version
+# already matches what is installed.  Leaving the version alone therefore ships
+# an app that calls an API its deployed copy of the library does not have, and
+# the failure surfaces as an ImportError at worker startup, not at deploy time.
+version = "1.1.2"
 description = "Shared option pricing and market data library"
 requires-python = ">=3.10"
 dependencies = [
