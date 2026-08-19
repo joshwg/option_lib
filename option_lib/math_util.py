@@ -147,6 +147,27 @@ SESSION_BASIS = {'pre': 'pre', 'regular': None, 'post': 'post', 'closed': 'post'
 EXTENDED_PRICE_KEY = {'pre': 'pre_market_price', 'post': 'post_market_price'}
 
 
+def bars_cache_ttl(interval: str, now: float | None = None, grace: int = 120) -> int:
+    """Seconds to cache a set of price bars of *interval* ('1h', '30m', '1d', …).
+
+    Bars only change when one completes, so the answer is "until *grace*
+    seconds past the next bar boundary" rather than a flat window: a refresh
+    at :02 sees the candle that closed at :00, and nothing is re-fetched in
+    between.  Intervals that do not parse, and daily-or-longer ones, fall back
+    to an hour.  Never less than 60 s.
+    """
+    now = time.time() if now is None else now
+    try:
+        n, unit = int(interval[:-1] or 1), interval[-1].lower()
+    except (ValueError, IndexError):
+        return 3600
+    span = n * {"m": 60, "h": 3600}.get(unit, 0)
+    if span <= 0 or span > 86400:
+        return 3600
+    next_boundary = (int(now) // span + 1) * span
+    return max(60, int(next_boundary - now) + grace)
+
+
 def market_session(now=None) -> str:
     """Which US equity session the clock is in: 'pre', 'regular', 'post', 'closed'.
 

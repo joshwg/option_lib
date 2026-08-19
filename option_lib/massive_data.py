@@ -29,6 +29,7 @@ from option_lib import name_cache as _name_cache
 from option_lib import pricing as _pricing
 from option_lib import yahoo_data as _yahoo      # fallback
 from option_lib.math_util import (
+    bars_cache_ttl,
     safe_float as _safe_float,
     TTLCache as _TTLCache,
     get_days_to_expiration,
@@ -236,7 +237,8 @@ def get_price_bars(ticker: str, days: int = 7, interval: str = "1h") -> list:
     unit m/h/d → minute/hour/day).  Regular session only is not something the
     aggregates endpoint can promise for hourly bars — they include extended
     hours — but the bars are adjusted and sorted.  Falls back to yahoo_data
-    when the key is missing or the call fails.  Cached for _TTL_BARS.
+    when the key is missing or the call fails.  Cached until just past the
+    next bar boundary (math_util.bars_cache_ttl).
     """
     if not _is_key_set() or _entitlement_blocked("equity aggregates"):
         return _yahoo.get_price_bars(ticker, days=days, interval=interval)
@@ -263,7 +265,7 @@ def get_price_bars(ticker: str, days: int = 7, interval: str = "1h") -> list:
              "l": float(b["l"]), "c": float(b["c"]), "v": int(b.get("v") or 0)}
             for b in (resp.get("results") or [])
         ]
-        _cache.set(cache_key, bars, _TTL_BARS)
+        _cache.set(cache_key, bars, bars_cache_ttl(interval))
         return bars
     except Exception as e:
         if not _note_entitlement_failure("equity aggregates", e):

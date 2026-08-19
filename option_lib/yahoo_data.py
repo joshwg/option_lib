@@ -26,6 +26,7 @@ except ImportError:
 from option_lib import implied_vol as _implied_vol
 from option_lib import iv_cache as _iv_cache
 from option_lib.math_util import (
+    bars_cache_ttl,
     safe_float as _safe_float,
     TTLCache as _TTLCache,
     iv_from_mid as _iv_from_mid,
@@ -437,16 +438,13 @@ def get_stock_info(ticker):
         }
 
 
-_TTL_BARS = int(os.environ.get('CACHE_TTL_BARS', 900))   # 15 min — intraday bars move
-
-
 def get_price_bars(ticker, days=7, interval='1h'):
     """Recent OHLC bars for *ticker*, oldest first.
 
     Returns a list of {'t': epoch_ms, 'o', 'h', 'l', 'c', 'v'} dicts covering
     the last *days* calendar days at *interval* ('1h' or '1d'; anything else
     Yahoo supports passes straight through).  Regular session only.  [] on any
-    error.  Cached for _TTL_BARS seconds.
+    error.  Cached until just past the next bar boundary (math_util.bars_cache_ttl).
     """
     interval = str(interval).lower()
     cache_key = ('get_price_bars', ticker.upper(), int(days), interval)
@@ -471,7 +469,7 @@ def get_price_bars(ticker, days=7, interval='1h'):
                 'c': float(c),
                 'v': int(row.get('Volume', 0) or 0),
             })
-        _cache.set(cache_key, bars, _TTL_BARS)
+        _cache.set(cache_key, bars, bars_cache_ttl(interval))
         return bars
     except Exception as e:
         print(f"Error fetching price bars for {ticker}: {e}")

@@ -358,3 +358,21 @@ class TestContractKey(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestBarsCacheTTL(unittest.TestCase):
+    """bars_cache_ttl(): cache until just past the next bar boundary."""
+
+    def test_hourly_expires_after_next_hour(self):
+        from option_lib.math_util import bars_cache_ttl
+        # at :50 → 10 min to the boundary + 2 min grace
+        self.assertEqual(bars_cache_ttl("1h", now=10 * 3600 + 50 * 60), 720)
+        # one second past the hour → nearly a full hour + grace
+        self.assertEqual(bars_cache_ttl("1h", now=10 * 3600 + 1), 3719)
+
+    def test_minute_bars_and_fallbacks(self):
+        from option_lib.math_util import bars_cache_ttl
+        self.assertEqual(bars_cache_ttl("30m", now=3 * 1800 + 100), 1820)
+        self.assertEqual(bars_cache_ttl("1d"), 3600)      # daily: flat hour
+        self.assertEqual(bars_cache_ttl("junk"), 3600)    # unparsable: flat hour
+        self.assertGreaterEqual(bars_cache_ttl("1h", now=3600 - 1, grace=0), 60)  # floor
