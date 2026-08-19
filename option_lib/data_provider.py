@@ -80,6 +80,14 @@ class DataProvider(ABC):
     def get_dividend_yield(self, ticker: str) -> float:
         """Dividend yield as a decimal (e.g. 0.02 for 2%)."""
 
+    @abstractmethod
+    def get_price_bars(self, ticker: str, days: int = 7, interval: str = "1h") -> list:
+        """Recent OHLC bars, oldest first: [{'t': epoch_ms, 'o','h','l','c','v'}, ...].
+
+        *days* is a calendar-day lookback; *interval* is '1h' or '1d'.  [] when
+        unavailable.  Used for sparklines, so providers cache it for minutes.
+        """
+
     # ── Historical volatility ─────────────────────────────────────────────────
 
     @abstractmethod
@@ -236,6 +244,9 @@ class YahooDataProvider(DataProvider):
     def get_dividend_yield(self, ticker):
         return self._m.get_dividend_yield(ticker)
 
+    def get_price_bars(self, ticker, days=7, interval="1h"):
+        return self._m.get_price_bars(ticker, days=days, interval=interval)
+
     def calculate_historical_volatility(self, ticker, period="1y", days=None):
         return self._m.calculate_historical_volatility(ticker, period=period, days=days)
 
@@ -331,6 +342,9 @@ class MassiveDataProvider(DataProvider):
 
     def get_dividend_yield(self, ticker):
         return self._m.get_dividend_yield(ticker)
+
+    def get_price_bars(self, ticker, days=7, interval="1h"):
+        return self._m.get_price_bars(ticker, days=days, interval=interval)
 
     def calculate_historical_volatility(self, ticker, period="1y", days=None):
         return self._m.calculate_historical_volatility(ticker, period=period, days=days)

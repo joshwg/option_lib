@@ -77,6 +77,9 @@ class CompositeDataProvider(DataProvider):
     def get_dividend_yield(self, ticker: str) -> float:
         return self.pricing_provider.get_dividend_yield(ticker)
 
+    def get_price_bars(self, ticker: str, days: int = 7, interval: str = "1h") -> list:
+        return self.pricing_provider.get_price_bars(ticker, days=days, interval=interval)
+
     def calculate_historical_volatility(self, ticker: str, period: str = "1y", days: int = None) -> float | None:
         return self.pricing_provider.calculate_historical_volatility(ticker, period=period, days=days)
 

@@ -229,6 +229,48 @@ def get_daily_bars_range(ticker: str, from_date: str, to_date: str) -> list:
         return []
 
 
+def get_price_bars(ticker: str, days: int = 7, interval: str = "1h") -> list:
+    """Recent OHLC bars from Massive, oldest first; same shape as yahoo_data.
+
+    *interval* is '1h' or '1d' (any '<n><unit>' Massive understands works:
+    unit m/h/d → minute/hour/day).  Regular session only is not something the
+    aggregates endpoint can promise for hourly bars — they include extended
+    hours — but the bars are adjusted and sorted.  Falls back to yahoo_data
+    when the key is missing or the call fails.  Cached for _TTL_BARS.
+    """
+    if not _is_key_set() or _entitlement_blocked("equity aggregates"):
+        return _yahoo.get_price_bars(ticker, days=days, interval=interval)
+
+    cache_key = ("massive_price_bars", ticker.upper(), int(days), interval)
+    cached, hit = _cache.get(cache_key)
+    if hit:
+        return cached
+
+    units = {"m": "minute", "h": "hour", "d": "day"}
+    try:
+        mult, unit = int(interval[:-1] or 1), units[interval[-1].lower()]
+    except (KeyError, ValueError):
+        mult, unit = 1, "hour"
+    to_str   = datetime.now().strftime("%Y-%m-%d")
+    from_str = (datetime.now() - timedelta(days=int(days))).strftime("%Y-%m-%d")
+    try:
+        resp = _get(
+            f"/v2/aggs/ticker/{ticker.upper()}/range/{mult}/{unit}/{from_str}/{to_str}",
+            {"adjusted": "true", "sort": "asc", "limit": 5000},
+        )
+        bars = [
+            {"t": int(b["t"]), "o": float(b["o"]), "h": float(b["h"]),
+             "l": float(b["l"]), "c": float(b["c"]), "v": int(b.get("v") or 0)}
+            for b in (resp.get("results") or [])
+        ]
+        _cache.set(cache_key, bars, _TTL_BARS)
+        return bars
+    except Exception as e:
+        if not _note_entitlement_failure("equity aggregates", e):
+            print(f"Massive: error fetching price bars for {ticker}: {e}")
+        return _yahoo.get_price_bars(ticker, days=days, interval=interval)
+
+
 # ── Stock info ─────────────────────────────────────────────────────────────────
 
 def get_stock_info(ticker: str) -> dict:

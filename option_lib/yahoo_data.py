@@ -437,6 +437,47 @@ def get_stock_info(ticker):
         }
 
 
+_TTL_BARS = int(os.environ.get('CACHE_TTL_BARS', 900))   # 15 min — intraday bars move
+
+
+def get_price_bars(ticker, days=7, interval='1h'):
+    """Recent OHLC bars for *ticker*, oldest first.
+
+    Returns a list of {'t': epoch_ms, 'o', 'h', 'l', 'c', 'v'} dicts covering
+    the last *days* calendar days at *interval* ('1h' or '1d'; anything else
+    Yahoo supports passes straight through).  Regular session only.  [] on any
+    error.  Cached for _TTL_BARS seconds.
+    """
+    interval = str(interval).lower()
+    cache_key = ('get_price_bars', ticker.upper(), int(days), interval)
+    cached, hit = _cache.get(cache_key)
+    if hit:
+        return cached
+
+    _yf_rate_limit()
+    try:
+        hist = yf.Ticker(ticker).history(period=f"{int(days)}d", interval=interval,
+                                         prepost=False, auto_adjust=False)
+        bars = []
+        for ts, row in hist.iterrows():
+            c = row.get('Close')
+            if c is None or c != c:          # NaN guard
+                continue
+            bars.append({
+                't': int(ts.timestamp() * 1000),
+                'o': float(row.get('Open', c)),
+                'h': float(row.get('High', c)),
+                'l': float(row.get('Low', c)),
+                'c': float(c),
+                'v': int(row.get('Volume', 0) or 0),
+            })
+        _cache.set(cache_key, bars, _TTL_BARS)
+        return bars
+    except Exception as e:
+        print(f"Error fetching price bars for {ticker}: {e}")
+        return []
+
+
 def calculate_historical_volatility(ticker, period='1y', days=None):
     """
     Calculate historical volatility from stock price history
